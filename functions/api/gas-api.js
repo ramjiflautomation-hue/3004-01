@@ -1,6 +1,6 @@
 function json(body, status = 200) {
   return new Response(JSON.stringify(body), {
-    status,
+    status: status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
       "Cache-Control": "no-store"
@@ -23,16 +23,21 @@ export async function onRequestPost({ request, env }) {
   }
 
   let payload;
+
   try {
     payload = await request.json();
-  } catch {
+  } catch (error) {
     return json({
       success: false,
       message: "Request body must be valid JSON."
     }, 400);
   }
 
-  if (!payload || typeof payload.fn !== "string" || !Array.isArray(payload.args)) {
+  if (
+    !payload ||
+    typeof payload.fn !== "string" ||
+    !Array.isArray(payload.args)
+  ) {
     return json({
       success: false,
       message: "Invalid API payload."
@@ -42,22 +47,24 @@ export async function onRequestPost({ request, env }) {
   try {
     const upstream = await fetch(gasUrl, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json"
+      },
       body: JSON.stringify(payload),
       redirect: "follow"
     });
 
-    const body = await upstream.text();
+    const responseBody = await upstream.text();
 
     if (!upstream.ok) {
       return json({
         success: false,
         message: "Google Apps Script returned HTTP " + upstream.status,
-        details: body.slice(0, 500)
+        details: responseBody.slice(0, 500)
       }, 502);
     }
 
-    return new Response(body || "null", {
+    return new Response(responseBody || "null", {
       status: 200,
       headers: {
         "Content-Type": "application/json; charset=utf-8",
@@ -67,8 +74,9 @@ export async function onRequestPost({ request, env }) {
   } catch (error) {
     return json({
       success: false,
-      message: error && error.message ? error.message : "Upstream API request failed."
+      message: error && error.message
+        ? error.message
+        : "Upstream API request failed."
     }, 502);
   }
 }
-```
