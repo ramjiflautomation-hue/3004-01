@@ -24,7 +24,6 @@ export async function onRequestPost({ request, env }) {
   }
 
   let payload;
-
   try {
     payload = await request.json();
   } catch {
@@ -34,11 +33,7 @@ export async function onRequestPost({ request, env }) {
     }, 400);
   }
 
-  if (
-    !payload ||
-    typeof payload.fn !== "string" ||
-    !Array.isArray(payload.args)
-  ) {
+  if (!payload || typeof payload.fn !== "string" || !Array.isArray(payload.args)) {
     return json({
       success: false,
       message: "Invalid API payload."
@@ -48,9 +43,7 @@ export async function onRequestPost({ request, env }) {
   try {
     const upstream = await fetch(gasUrl, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
       redirect: "follow"
     });
@@ -61,17 +54,7 @@ export async function onRequestPost({ request, env }) {
       return json({
         success: false,
         message: "Google Apps Script returned HTTP " + upstream.status,
-        details: body.slice(0, 1000)
-      }, 502);
-    }
-
-    try {
-      JSON.parse(body);
-    } catch {
-      return json({
-        success: false,
-        message: "Google Apps Script returned a non-JSON response.",
-        details: body.slice(0, 1000)
+        details: body.slice(0, 500)
       }, 502);
     }
 
@@ -82,13 +65,10 @@ export async function onRequestPost({ request, env }) {
         "Cache-Control": "no-store"
       }
     });
-
   } catch (error) {
     return json({
       success: false,
-      message: error && error.message
-        ? error.message
-        : "Upstream API request failed."
+      message: error && error.message ? error.message : "Upstream API request failed."
     }, 502);
   }
 }
