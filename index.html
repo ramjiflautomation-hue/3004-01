@@ -3231,40 +3231,24 @@ input[type="date"]::-webkit-calendar-picker-indicator,input[type="time"]::-webki
     google.script.run.withSuccessHandler(function(p){portalEffectivePermissions=p||{};if(document.getElementById("page-pmChecklist")&&document.getElementById("page-pmChecklist").classList.contains("active"))renderPMChecklist();}).withFailureHandler(function(){portalEffectivePermissions={};}).getCurrentPortalPermissions(currentSessionId);
   }
   function loadPMChecklist() {
-    const monthSelect=document.getElementById("pmMonthFilter");
-    // Default to the current month on first load to avoid scanning every date tab.
-    if(monthSelect && !monthSelect.dataset.pmInitialized){
-      const now=new Date();
-      const currentMonth=String(now.getFullYear())+"-"+String(now.getMonth()+1).padStart(2,"0");
-      if(!Array.from(monthSelect.options).some(function(o){return o.value===currentMonth;})){
-        const opt=document.createElement("option");
-        opt.value=currentMonth;
-        opt.textContent=pmMonthLabel_(currentMonth);
-        monthSelect.appendChild(opt);
-      }
-      monthSelect.value=currentMonth;
-      monthSelect.dataset.pmInitialized="1";
-    }
-    const requestedMonth=monthSelect ? (monthSelect.value||"all") : "all";
     if(window.showPortalLoading) window.showPortalLoading("Loading PM checklist…");
     const body=document.getElementById("pmChecklistBody"), msg=document.getElementById("pmChecklistMessage");
     if(body)body.innerHTML='<tr><td colspan="9">Loading checklist…</td></tr>';
     if(msg){msg.className="message";msg.textContent="";}
-    google.script.run.withSuccessHandler(function(res){
-      if(!res||!res.success){if(msg){msg.className="message error show";msg.textContent=(res&&res.message)||"Unable to load PM checklist.";}if(body)body.innerHTML='<tr><td colspan="9">Checklist unavailable.</td></tr>';return;}
-      if(window.hidePortalLoading) window.hidePortalLoading();
-      pmChecklistRows=res.rows||[];
-      if(pmSelectedDate&&!pmGetDateRows_(pmSelectedDate).length)pmSelectedDate="";
-      renderPMChecklist();
-      if(msg){msg.className="message success show";msg.textContent=(res.message||("Loaded "+pmChecklistRows.length+" checklist points."))+" Select a date below to see its details.";}
-    }).withFailureHandler(function(err){if(window.hidePortalLoading)window.hidePortalLoading();if(msg){msg.className="message error show";msg.textContent=(err&&err.message)||"PM checklist load failed.";}if(body)body.innerHTML='<tr><td colspan="9">Could not load checklist.</td></tr>';}).getPMChecklist(currentSessionId, requestedMonth==="all" ? "" : requestedMonth);
+    fetch("/api/pm-checklist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({fn:"getPMChecklist",args:[currentSessionId]})})
+      .then(function(r){return r.json();}).then(function(res){
+        if(window.hidePortalLoading)window.hidePortalLoading();
+        if(!res||!res.success){if(msg){msg.className="message error show";msg.textContent=(res&&res.message)||"Unable to load PM checklist.";}if(body)body.innerHTML='<tr><td colspan="9">Checklist unavailable.</td></tr>';return;}
+        pmChecklistRows=res.rows||[];if(pmSelectedDate&&!pmGetDateRows_(pmSelectedDate).length)pmSelectedDate="";renderPMMonthOptions_(pmChecklistRows.map(function(r){return r.dueDate||"";}));renderPMChecklist();
+        if(msg){msg.className="message success show";msg.textContent=(res.message||("Loaded "+pmChecklistRows.length+" checklist points."))+" Select a date below to see its details.";}
+      }).catch(function(err){if(window.hidePortalLoading)window.hidePortalLoading();if(msg){msg.className="message error show";msg.textContent=(err&&err.message)||"PM checklist load failed.";}if(body)body.innerHTML='<tr><td colspan="9">Could not load checklist.</td></tr>';});
   }
   function pmFormatDate_(iso){if(!iso)return "Unscheduled";const p=String(iso).split("-");return p.length===3?p[2]+"-"+p[1]+"-"+p[0]:iso;}
   function pmRowDates_(r){let ds=Array.isArray(r.dueDates)?r.dueDates.slice():[];if(!ds.length&&r.dueDate)ds=[r.dueDate];return ds.filter(Boolean);}
   function pmGetDateRows_(date){return pmChecklistRows.filter(function(r){return pmRowDates_(r).indexOf(date)>=0;});}
   function pmMonthOf_(date){return /^\d{4}-\d{2}-\d{2}$/.test(String(date||""))?String(date).slice(0,7):"";}
   function pmMonthLabel_(month){if(!/^\d{4}-\d{2}$/.test(month))return month;const p=month.split("-");return new Date(Number(p[0]),Number(p[1])-1,1).toLocaleDateString("en-GB",{month:"long",year:"numeric"});}
-  function onPMMonthChange(){pmSelectedDate="";loadPMChecklist();}
+  function onPMMonthChange(){pmSelectedDate="";renderPMChecklist();}
   function selectPMDate(date){pmSelectedDate=(pmSelectedDate===date)?"":date;renderPMChecklist();}
   function renderPMMonthOptions_(dates){
     const sel=document.getElementById("pmMonthFilter");if(!sel)return;
@@ -3371,7 +3355,7 @@ input[type="date"]::-webkit-calendar-picker-indicator,input[type="time"]::-webki
     const key=sheetId+'-'+rowNumber,conditionEl=document.getElementById("pm-condition-"+key),etaEl=document.getElementById("pm-eta-"+key);
     const condition=conditionEl?conditionEl.value:"",eta=etaEl?etaEl.value:"",msg=document.getElementById("pmChecklistMessage");
     if(condition!=="OK"&&!eta){if(msg){msg.className="message error show";msg.textContent="Open / pending task ke liye ETA / next planned date required hai.";}return;}
-    google.script.run.withSuccessHandler(function(res){if(window.hidePortalLoading)window.hidePortalLoading();if(msg){msg.className=res&&res.success?"message success show":"message error show";msg.textContent=(res&&res.message)||"Save complete.";}if(res&&res.success)loadPMChecklist();}).withFailureHandler(function(err){if(window.hidePortalLoading)window.hidePortalLoading();if(msg){msg.className="message error show";msg.textContent=(err&&err.message)||"Save failed.";}}).savePMChecklistRow(currentSessionId,sheetId,rowNumber,condition,eta);
+    fetch("/api/pm-checklist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({fn:"savePMChecklistRow",args:[currentSessionId,sheetId,rowNumber,condition,eta]})}).then(function(r){return r.json();}).then(function(res){if(window.hidePortalLoading)window.hidePortalLoading();if(msg){msg.className=res&&res.success?"message success show":"message error show";msg.textContent=(res&&res.message)||"Save complete.";}if(res&&res.success)loadPMChecklist();}).catch(function(err){if(window.hidePortalLoading)window.hidePortalLoading();if(msg){msg.className="message error show";msg.textContent=(err&&err.message)||"Save failed.";}});
   }
   function loadShiftRoster() {
     const head=document.getElementById("shiftRosterHead"),body=document.getElementById("shiftRosterBody"),msg=document.getElementById("rosterMessage");

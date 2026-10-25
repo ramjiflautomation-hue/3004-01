@@ -1,21 +1,23 @@
-# FAPL Maintenance Portal — Cloudflare Pages
+# PM Checklist D1 Integration — candidate package
 
-## Is folder mein kya hai
-- `index.html` — portal frontend
-- `netlify-api-bridge.js` — purane `google.script.run` frontend calls ko API endpoint par bhejne ka bridge (filename purana hai; isse rename na karein)
-- `functions/api/gas-api.js` — Cloudflare Pages API proxy
+This package adds a dedicated Cloudflare Pages route at `functions/api/pm-checklist.js`; it does **not** change `gas-api.js`.
 
-**`Code.gs` yahan jaan-boojhkar nahi rakha gaya hai.** Use Google Apps Script editor mein hi rakhein; public GitHub repo mein backend source ya secrets upload na karein.
+## What it does
+- Reads PM checklist rows from D1 `DB` binding/table `pm_checklist_rows`.
+- Checks the existing Apps Script session and `maintenance.view` / `maintenance.edit` permissions before responding.
+- For saves, calls the existing Apps Script `savePMChecklistRow` first, preserving its Google Sheet write and configured notification behavior; only after that succeeds does it update the matching D1 row.
+- Updates the frontend PM Checklist load/save calls to use `/api/pm-checklist`; other portal calls remain on their existing `google.script.run` path.
+- Adds `getCurrentPortalPermissions` and `savePMChecklistRow` to the Apps Script `doPost` allowlist. These functions already exist in the supplied Code.gs; this is dispatcher registration only.
 
-## GitHub par upload
-1. Is ZIP ko extract karein.
-2. Is folder ke andar ki files/folder ko repository ke root mein upload karein — folder ko ek aur folder ke andar nest na karein.
-3. GitHub root par `index.html`, `netlify-api-bridge.js`, aur `functions/api/gas-api.js` ka path hona chahiye.
-4. Cloudflare Pages project ko GitHub repository se deploy karein. Framework preset `None`, build command blank, build output directory `.`.
-5. Cloudflare Pages → Settings → Variables and Secrets → Production mein `GAS_WEB_APP_URL` naam ka variable banayein. Value Google Apps Script Web App URL ho jo `/exec` par khatam hota ho.
-6. Save karke naya deployment trigger karein.
+## Required deployment details
+1. Keep the Cloudflare Pages `DB` binding pointed at `portal-db` and `GAS_WEB_APP_URL` set as before.
+2. Put `functions/api/pm-checklist.js` at the Pages project root under `functions/api/`.
+3. Deploy the included `index.html` as the Pages root page.
+4. Apply the included `Code.gs` change to the Apps Script project and deploy a new web-app version. This allowlist change is required for permission validation and PM saves through the gateway.
+5. Do not rerun the initial bulk import just to deploy the route. D1 table must contain the existing 7,305 rows and have the schema in `pm_checklist_d1_schema.sql`.
 
-## Zaroori check
-Google Apps Script deployment ko Web app ke roop mein deploy hona chahiye, access aapke portal users ke liye sahi set hona chahiye, aur `doPost(e)` ko `{ "fn": "loginUser", "args": [...] }` jaise JSON payload ka jawab dena chahiye.
-
-Yeh package file structure aur Cloudflare Pages proxy ke liye hai; live Apps Script deployment aur login credentials ke saath end-to-end test karna abhi baaki hai. Agar login fail ho, error/screenshot bhejein — Apps Script ke handler allowlist aur return format ko verify karna hoga.
+## Important behavior / limits
+- The source Google Sheet remains authoritative for saves. D1 is updated only after Apps Script confirms the source write.
+- Existing notifications are sent by Apps Script as before; this route does not send a second notification.
+- If the source spreadsheet changes independently outside this portal, D1 will not automatically refresh. Re-import/sync needs a separate scheduled sync job.
+- This package has not been deployed to your Cloudflare/GAS accounts from this chat. Test in a preview deployment first, especially permissions, date filters, and a single test-row save.
