@@ -1,6 +1,6 @@
 function json(body, status = 200) {
   return new Response(JSON.stringify(body), {
-    status: status,
+    status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
       "Cache-Control": "no-store"
@@ -18,7 +18,8 @@ export async function onRequestPost({ request, env }) {
   if (!gasUrl) {
     return json({
       success: false,
-      message: "GAS_WEB_APP_URL is not configured in Cloudflare Pages environment variables."
+      stage: "configuration",
+      message: "GAS_WEB_APP_URL is missing."
     }, 500);
   }
 
@@ -26,45 +27,57 @@ export async function onRequestPost({ request, env }) {
 
   try {
     payload = await request.json();
-  } catch (error) {
+  } catch {
     return json({
       success: false,
-      message: "Request body must be valid JSON."
+      stage: "request",
+      message: "Invalid JSON request body."
     }, 400);
   }
 
-  if (
-    !payload ||
-    typeof payload.fn !== "string" ||
-    !Array.isArray(payload.args)
-  ) {
+  if (!payload || typeof payload.fn !== "string" ||
+      !Array.isArray(payload.args)) {
     return json({
       success: false,
-      message: "Invalid API payload."
+      stage: "request",
+      message: "Expected fn and args in request."
     }, 400);
   }
 
   try {
     const upstream = await fetch(gasUrl, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
       redirect: "follow"
     });
 
-    const responseBody = await upstream.text();
+    const body = await upstream.text();
 
     if (!upstream.ok) {
       return json({
         success: false,
-        message: "Google Apps Script returned HTTP " + upstream.status,
-        details: responseBody.slice(0, 500)
+        stage: "google-apps-script",
+        function: payload.fn,
+        upstreamStatus: upstream.status,
+        message: "Google Apps Script returned a non-success status.",
+        details: body.slice(0, 2000)
       }, 502);
     }
 
-    return new Response(responseBody || "null", {
+    try {
+      JSON.parse(body);
+    } catch {
+      return json({
+        success: false,
+        stage: "response",
+        function: payload.fn,
+        message: "Apps Script response was not valid JSON.",
+        details: body.slice(0, 2000)
+      }, 502);
+    }
+
+    return new Response(body, {
       status: 200,
       headers: {
         "Content-Type": "application/json; charset=utf-8",
@@ -74,9 +87,9 @@ export async function onRequestPost({ request, env }) {
   } catch (error) {
     return json({
       success: false,
-      message: error && error.message
-        ? error.message
-        : "Upstream API request failed."
+      stage: "fetch",
+      function: payload.fn,
+      message: error?.message || "Request to Apps Script failed."
     }, 502);
   }
 }
