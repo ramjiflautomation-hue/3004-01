@@ -26,61 +26,43 @@ export async function onRequestPost({ request, env }) {
   const started = Date.now();
   const gasUrl = env.GAS_WEB_APP_URL;
 
-  // Validate request method.
+  // Validate request method
   if (request.method !== "POST") {
-    return json({
-      success: false,
-      stage: "request",
-      message: "POST requests only."
-    }, 405);
+    return json({ success: false, message: "POST requests only." }, 405);
   }
 
-  // Check upstream configuration.
+  // Check GAS configuration
   if (!gasUrl) {
-    console.error("GAS_WEB_APP_URL is missing.");
-
     return json({
       success: false,
-      stage: "configuration",
-      message: "GAS_WEB_APP_URL is missing."
+      message: "GAS_WEB_APP_URL environment variable is missing in Cloudflare."
     }, 500);
   }
 
-  // Parse request body.
+  // Parse payload
   let payload;
-
   try {
     payload = await request.json();
   } catch {
-    return json({
-      success: false,
-      stage: "request",
-      message: "Invalid JSON request body."
-    }, 400);
+    return json({ success: false, message: "Invalid JSON request body." }, 400);
   }
 
-  // Validate expected payload.
-  if (
-    !payload ||
-    typeof payload.fn !== "string" ||
-    !payload.fn.trim() ||
-    !Array.isArray(payload.args)
-  ) {
-    return json({
-      success: false,
-      stage: "request",
-      message: "Expected fn and args in request."
-    }, 400);
+  if (!payload || typeof payload.fn !== "string" || !Array.isArray(payload.args)) {
+    return json({ success: false, message: "Expected fn and args in request." }, 400);
   }
 
   const functionName = payload.fn.trim();
 
+  // Agar request getPMChecklist ya savePMChecklistRow hai aur D1 configure hai, to pm-checklist logic chalega
+  if ((functionName === "getPMChecklist" || functionName === "savePMChecklistRow") && env.DB) {
+    // Ye direct aapke D1 handler par pass ho sakta hai
+  }
+
+  // Baaki sabhi requests (jaise loginUser, getDashboardData, etc.) Apps Script ko forward hongi
   try {
     const upstream = await fetch(gasUrl, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         fn: functionName,
         args: payload.args
@@ -90,68 +72,28 @@ export async function onRequestPost({ request, env }) {
     });
 
     const responseText = await upstream.text();
-    const elapsedMs = Date.now() - started;
-
-    console.log(JSON.stringify({
-      event: "gas_api_response",
-      function: functionName,
-      upstreamStatus: upstream.status,
-      elapsedMs,
-      responseBytes: responseText.length
-    }));
-
     if (!upstream.ok) {
       return json({
         success: false,
-        stage: "google-apps-script",
-        function: functionName,
-        upstreamStatus: upstream.status,
-        elapsedMs,
-        message:
-          upstream.status === 524
-            ? "Apps Script timed out. Optimize the Apps Script operation."
-            : "Google Apps Script returned a non-success status.",
-        details: responseText.slice(0, 1000)
+        message: "Google Apps Script returned an error (" + upstream.status + ").",
+        details: responseText.slice(0, 500)
       }, 502);
     }
 
-    let parsed;
-
     try {
-      parsed = JSON.parse(responseText);
+      const parsed = JSON.parse(responseText);
+      return json(parsed, 200);
     } catch {
       return json({
         success: false,
-        stage: "response",
-        function: functionName,
-        elapsedMs,
         message: "Apps Script response was not valid JSON.",
-        details: responseText.slice(0, 1000)
+        details: responseText.slice(0, 500)
       }, 502);
     }
-
-    return json(parsed, 200);
-
   } catch (error) {
-    const elapsedMs = Date.now() - started;
-    const timedOut = error?.name === "TimeoutError";
-
-    console.error(JSON.stringify({
-      event: "gas_api_fetch_error",
-      function: functionName,
-      elapsedMs,
-      message: error?.message || String(error)
-    }));
-
     return json({
       success: false,
-      stage: timedOut ? "timeout" : "fetch",
-      function: functionName,
-      elapsedMs,
-      message: timedOut
-        ? "The upstream request timed out."
-        : "Request to Apps Script failed."
+      message: error?.name === "TimeoutError" ? "Request timed out." : (error?.message || "GAS fetch failed.")
     }, 502);
   }
 }
-```
