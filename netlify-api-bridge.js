@@ -1,7 +1,9 @@
+
 (function () {
   "use strict";
 
   var endpoint = "/api/gas-api";
+
   var googleShim = window.google = window.google || {};
   googleShim.script = googleShim.script || {};
 
@@ -10,21 +12,30 @@
     _failure: function () {},
 
     withSuccessHandler: function (fn) {
-      this._success = typeof fn === "function" ? fn : function () {};
+      this._success = typeof fn === "function"
+        ? fn
+        : function () {};
       return this;
     },
 
     withFailureHandler: function (fn) {
-      this._failure = typeof fn === "function" ? fn : function () {};
+      this._failure = typeof fn === "function"
+        ? fn
+        : function () {};
       return this;
     }
   };
 
   googleShim.script.run = new Proxy(runner, {
     get: function (target, property) {
-      if (property in target) return target[property];
+      if (property in target) {
+        return target[property];
+      }
 
-      if (typeof property !== "string" || property.charAt(0) === "_") {
+      if (
+        typeof property !== "string" ||
+        property.charAt(0) === "_"
+      ) {
         return undefined;
       }
 
@@ -38,8 +49,13 @@
 
         fetch(endpoint, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ fn: property, args: args })
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            fn: property,
+            args: args
+          })
         })
           .then(function (response) {
             return response.text().then(function (text) {
@@ -47,7 +63,7 @@
 
               try {
                 result = JSON.parse(text);
-              } catch (_) {
+              } catch (error) {
                 throw new Error(
                   "API HTTP " + response.status + ": " +
                   text.slice(0, 1000)
@@ -57,7 +73,11 @@
               if (!response.ok) {
                 throw new Error(
                   "API HTTP " + response.status + ": " +
-                  (result.message || result.details || text)
+                  (
+                    result.message ||
+                    result.details ||
+                    text
+                  )
                 );
               }
 
