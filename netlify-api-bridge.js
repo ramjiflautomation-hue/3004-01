@@ -2,7 +2,8 @@
 (function () {
   "use strict";
 
-  var endpoint = "/api/gas-api";
+  var gasEndpoint = "/api/gas-api";
+  var pmEndpoint = "/api/pm-checklist";
 
   var googleShim = window.google = window.google || {};
   googleShim.script = googleShim.script || {};
@@ -28,9 +29,7 @@
 
   googleShim.script.run = new Proxy(runner, {
     get: function (target, property) {
-      if (property in target) {
-        return target[property];
-      }
+      if (property in target) return target[property];
 
       if (
         typeof property !== "string" ||
@@ -46,6 +45,12 @@
 
         target._success = function () {};
         target._failure = function () {};
+
+        var endpoint =
+          property === "getPMChecklist" ||
+          property === "savePMChecklistRow"
+            ? pmEndpoint
+            : gasEndpoint;
 
         fetch(endpoint, {
           method: "POST",
@@ -73,11 +78,7 @@
               if (!response.ok) {
                 throw new Error(
                   "API HTTP " + response.status + ": " +
-                  (
-                    result.message ||
-                    result.details ||
-                    text
-                  )
+                  (result.message || result.details || text)
                 );
               }
 
