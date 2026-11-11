@@ -1,8 +1,88 @@
 const SPREADSHEET_ID = "1hz8AsbfyxGodqdyFL9-3eOzIrdsdxcmgKMekQgF-YUE";
+// Web-app-safe spreadsheet accessor. Do not use getActiveSpreadsheet() in web-app requests.
+function getPortalSpreadsheet_() {
+  if (!SPREADSHEET_ID) {
+    throw new Error("SPREADSHEET_ID is not configured.");
+  }
+  return SpreadsheetApp.openById(SPREADSHEET_ID);
+}
+
 const SHEET_NAME = "Web app dev";
 const EMAIL_SHEET_NAME = "Mail ID's";
 const SEARCH_ITEM_SHEET_NAME = "Search Item";
 const STOCK_SHEET_NAME = "Automatic Spare Tracker";
+
+// =========================================================
+// CLOUDFLARE D1 — MATERIAL REQUEST PRIMARY WRITE (STAGE 1)
+// Script Properties required: D1_WORKER_URL and D1_API_TOKEN
+// Google Sheets remains a secondary mirror/backup in this stage.
+// These names are intentionally unique to avoid conflicts with D1Database.gs.
+// =========================================================
+function d1LegacyRequest_(path, payload) {
+  const props = PropertiesService.getScriptProperties();
+  const baseUrl = String(props.getProperty("D1_WORKER_URL") || "").trim().replace(/\/+$/, "");
+  const token = String(props.getProperty("D1_API_TOKEN") || "").trim();
+  if (!baseUrl || !token) {
+    throw new Error("D1 settings missing: D1_WORKER_URL and D1_API_TOKEN must be set in Script Properties.");
+  }
+
+  const response = UrlFetchApp.fetch(baseUrl + path, {
+    method: "post",
+    contentType: "application/json",
+    headers: { Authorization: "Bearer " + token },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+  const status = response.getResponseCode();
+  const responseText = response.getContentText() || "";
+  let result;
+  try {
+    result = JSON.parse(responseText);
+  } catch (parseError) {
+    throw new Error("D1 API returned invalid JSON (HTTP " + status + ").");
+  }
+  if (status < 200 || status >= 300 || result.success !== true) {
+    throw new Error("D1 API failed (HTTP " + status + "): " + (result.message || "Unknown error"));
+  }
+  return result;
+}
+
+function d1LegacySaveMaterialRequestRows_(requestId, rows) {
+  rows.forEach(function(row, index) {
+    const recordId = String(requestId) + "-" + String(index + 1);
+    d1LegacyRequest_("/api/records/upsert", {
+      table: "material_requests",
+      id: recordId,
+      data: {
+        requestId: String(requestId),
+        requestIdColumn: String(row[17] || ""),
+        lineNumber: index + 1,
+        timestamp: row[0] instanceof Date ? row[0].toISOString() : String(row[0] || ""),
+        email: String(row[1] || ""),
+        mobile: String(row[2] || ""),
+        name: String(row[3] || ""),
+        itemName: String(row[4] || ""),
+        quantity: Number(row[5] || 0),
+        itemId: String(row[6] || ""),
+        date: row[7] instanceof Date ? row[7].toISOString() : String(row[7] || ""),
+        status: String(row[8] || ""),
+        stationId: String(row[9] || ""),
+        remark: String(row[10] || ""),
+        closingRemark: String(row[11] || ""),
+        rejectionRemark: String(row[12] || ""),
+        spareRequestStatus: String(row[13] || ""),
+        toolNo: String(row[14] || ""),
+        ticketId: String(row[15] || ""),
+        mailNotification: String(row[16] || ""),
+        additionalMailIds: String(row[18] || ""),
+        mailThread: String(row[19] || ""),
+        lastMailId: String(row[20] || ""),
+        requestType: String(row[21] || ""),
+        requestDetail: String(row[22] || "")
+      }
+    });
+  });
+}
 
 // =========================================================
 // PORTAL AUTHENTICATION SETTINGS
@@ -57,13 +137,18 @@ function submitRequest(data) {
     "create"
   );
 
+  // Tracks whether the primary D1 write completed so a later failure does not
+  // tell the user to resubmit and accidentally create a duplicate request.
+  let d1PrimarySaved = false;
+  let activeRequestId = "";
+
   try {
     const portalRequestType = String(
       data && data.requestType || "New Material"
     ).trim();
 
     if (!data || !data.email || !data.name || !data.mobile || !data.stationId ||
-        (!isNewSpareRequest && !data.ticketId)) {
+        (portalRequestType !== "New Spare Request" && !String(data.ticketId || "").trim())) {
       return { success: false, message: "Please fill all required details." };
     }
 
@@ -71,7 +156,7 @@ function submitRequest(data) {
       return { success: false, message: "Please add at least one item." };
     }
 
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const ss = getPortalSpreadsheet_();
     const sheet = ss.getSheetByName(SHEET_NAME);
 
     if (!sheet) {
@@ -99,6 +184,7 @@ function submitRequest(data) {
       ) +
       "-" +
       Utilities.getUuid().slice(0, 6).toUpperCase();
+    activeRequestId = requestId;
 
     data.items.forEach(function(item) {
       const itemId = String(item.itemId || "").trim();
@@ -123,6 +209,7 @@ function submitRequest(data) {
           throw new Error("Consumed Material details are required.");
         }
       } else if (
+        portalRequestType !== "New Spare Request" &&
         requestType &&
         requestType !== "Scrap" &&
         requestType !== "Consumable" &&
@@ -131,8 +218,10 @@ function submitRequest(data) {
         throw new Error("Invalid Material Type. Select Scrap, Consumable or Returnable.");
       }
 
+      // New Spare Requesters do not choose Material Type. Leave it blank until
+      // the authorized approver selects Scrap / Consumable / Returnable.
       if (portalRequestType === "New Spare Request") {
-        requestType = "Replacement";
+        requestType = "";
       }
 
       // Actual Web app dev columns:
@@ -186,12 +275,17 @@ function submitRequest(data) {
       ]);
     });
 
+    // D1 is written first (primary); existing Google Sheets write remains the backup mirror.
+    // If D1 fails, stop here rather than reporting a successful request without the primary save.
+    d1LegacySaveMaterialRequestRows_(requestId, rows);
+    d1PrimarySaved = true;
+
     const startRow = Math.max(sheet.getLastRow() + 1, 2);
     sheet.getRange(startRow, 1, rows.length, 23).setValues(rows);
     if (portalRequestType === "Consumed Material") {
       const breakdownResult = saveConsumedBreakdownFromMaterialRequest_(data);
       if (!breakdownResult.success) {
-        return { success: false, message: breakdownResult.message || "Breakdown details could not be saved." };
+        throw new Error(breakdownResult.message || "Breakdown details could not be saved.");
       }
     }
 
@@ -199,10 +293,7 @@ function submitRequest(data) {
     const emailSheet = ss.getSheetByName(EMAIL_SHEET_NAME);
 
     if (!emailSheet) {
-      return {
-        success: false,
-        message: "Request saved, but 'Mail ID\'s' sheet was not found for email."
-      };
+      throw new Error("'Mail ID's' sheet was not found for email.");
     }
 
     const lastEmailRow = emailSheet.getLastRow();
@@ -237,7 +328,7 @@ function submitRequest(data) {
           "<td style='padding:8px;border:1px solid #ddd;'>" + escapeHtml(item.itemId) + "</td>" +
           "<td style='padding:8px;border:1px solid #ddd;'>" + escapeHtml(item.itemName || item.partName || "") + "</td>" +
           "<td style='padding:8px;border:1px solid #ddd;text-align:center;'>" + Number(item.qty) + "</td>" +
-          "<td style='padding:8px;border:1px solid #ddd;'>" + escapeHtml(item.requestType || "Replacement") + "</td>" +
+          "<td style='padding:8px;border:1px solid #ddd;'>" + escapeHtml(portalRequestType === "New Spare Request" ? "Pending approver selection" : (item.requestType || "Replacement")) + "</td>" +
           "<td style='padding:8px;border:1px solid #ddd;'>" + escapeHtml(item.requestStatus) + "</td>" +
           "</tr>";
       });
@@ -367,15 +458,37 @@ function submitRequest(data) {
       }
     }
 
+    // Mirror the final sheet row values (including mail thread/message IDs and
+    // status-mail flags written by existing logic) back into D1.
+    const finalRows = sheet.getRange(startRow, 1, rows.length, 23).getValues();
+    d1LegacySaveMaterialRequestRows_(requestId, finalRows);
+
     return {
       success: true,
-      message: "Request submitted successfully! " + data.items.length + " item(s) saved."
+      message: "Request submitted successfully! " + data.items.length + " item(s) saved.",
+      requestId: requestId,
+      d1Status: "synced",
+      sheetsBackupStatus: "synced"
     };
 
   } catch (error) {
+    const errorMessage = error && error.message ? error.message : String(error);
+    if (d1PrimarySaved) {
+      // D1 already has the request. Return a non-retry warning to avoid a
+      // second submission creating a duplicate request with a new request ID.
+      Logger.log("Material Request post-D1 processing/sync issue for " + activeRequestId + ": " + errorMessage);
+      return {
+        success: true,
+        warning: true,
+        requestId: activeRequestId,
+        d1Status: "saved",
+        sheetsBackupStatus: "check_required",
+        message: "Request D1 mein save ho gayi (Ref: " + activeRequestId + "), lekin Google Sheets backup ya baad ka processing step complete nahi hua. Kripya dobara submit na karein; administrator ko sync check karna hoga. Details: " + errorMessage
+      };
+    }
     return {
       success: false,
-      message: error && error.message ? error.message : String(error)
+      message: errorMessage
     };
   }
 }
@@ -396,6 +509,7 @@ function submitBreakdownFromMaterialRequest_legacyAdapter_(data, d) {
   d = d || {};
   const actualTpt = Number(d.actualTpt != null ? d.actualTpt : (d.tptDuringBreakdown != null ? d.tptDuringBreakdown : d.tptPerHour || 0));
   const payload = {
+    sessionId: data.sessionId,
     email: data.email, name: data.name, mobile: data.mobile,
     ticketId: data.ticketId, breakdownType: d.breakdownType,
     issueOwner: d.issueOwner, startTime: d.startTime, endTime: d.endTime,
@@ -403,6 +517,51 @@ function submitBreakdownFromMaterialRequest_legacyAdapter_(data, d) {
     spares: d.spares || [], orderSpare: d.orderSpare || "No", orderSpares: d.orderSpares || []
   };
   return submitBreakdownFromMaterialRequest(payload);
+}
+
+
+function getFixedScheduledOverlapMs_(start, end) {
+  if (!(start instanceof Date) || !(end instanceof Date) || end <= start) return 0;
+  var tz = Session.getScriptTimeZone() || "Asia/Kolkata";
+  var dayKey = Utilities.formatDate(start, tz, "yyyy-MM-dd").split("-");
+  var cursor = new Date(+dayKey[0], +dayKey[1]-1, +dayKey[2]);
+  var total = 0;
+  while (cursor < end) {
+    [[13,14],[22,23]].forEach(function(slot) {
+      var a = new Date(cursor.getFullYear(), cursor.getMonth(), cursor.getDate(), slot[0], 0, 0);
+      var b = new Date(cursor.getFullYear(), cursor.getMonth(), cursor.getDate(), slot[1], 0, 0);
+      var os = Math.max(start.getTime(), a.getTime()), oe = Math.min(end.getTime(), b.getTime());
+      if (oe > os) total += oe-os;
+    });
+    cursor = new Date(cursor.getFullYear(), cursor.getMonth(), cursor.getDate()+1);
+  }
+  return total;
+}
+function getEffectiveBreakdownMs_(start,end) {
+  return Math.max(0, end.getTime()-start.getTime()-getFixedScheduledOverlapMs_(start,end));
+}
+function getEffectiveBreakdownHours_(start,end) {
+  return getEffectiveBreakdownMs_(start,end)/3600000;
+}
+function assertUniqueBreakdownTicket_(sheet,ticketId) {
+  var key=String(ticketId||"").trim().toLowerCase();
+  if (!key || sheet.getLastRow()<2) return;
+  var rows=sheet.getRange(2,4,sheet.getLastRow()-1,2).getDisplayValues();
+  for (var i=0;i<rows.length;i++) {
+    var t=String(rows[i][0]||"").trim().toLowerCase();
+    var type=String(rows[i][1]||"").trim().toLowerCase();
+    if (t===key && type && type!=="consumed spare recorded") {
+      throw new Error("Ticket ID '"+ticketId+"' already has a Breakdown record. Only one Breakdown record is allowed per Ticket ID.");
+    }
+  }
+}
+function getBreakdownLossForRange_(row, overlapStart, overlapEnd) {
+  var start=getReportDateValue_(row[5]), end=getReportDateValue_(row[6]);
+  if (!start || !end || end<=start) return 0;
+  var full=getEffectiveBreakdownMs_(start,end);
+  var part=getEffectiveBreakdownMs_(overlapStart,overlapEnd);
+  if (full<=0 || part<=0) return 0;
+  return Math.max(0,Number(row[11]||0))*Math.min(1,part/full);
 }
 
 function submitBreakdownFromMaterialRequest(data) {
@@ -458,20 +617,35 @@ function submitBreakdownFromMaterialRequest(data) {
       orderSpare = "No";
     }
 
-    const hours = (end - start) / 3600000;
+    const lock = LockService.getScriptLock();
+    lock.waitLock(30000);
+    let sheet;
+    try {
+      sheet = ensureBreakdownSheet_();
+      assertUniqueBreakdownTicket_(sheet, ticketId);
+    } catch (lockError) {
+      lock.releaseLock();
+      throw lockError;
+    }
+    const hours = getEffectiveBreakdownHours_(start, end);
+    if (hours <= 0) { lock.releaseLock(); return {success:false,message:"Breakdown duration is fully inside scheduled downtime (13:00-14:00 / 22:00-23:00)."}; }
     const expectedTpt = hours * 12000;
     const tptLoss = Math.max(0, expectedTpt - actualTpt);
     const percent = (hours / 24) * 100;
-    const sheet = ensureBreakdownSheet_();
+    try {
     sheet.getRange(sheet.getLastRow()+1,1,1,22).setValues([[
       new Date(), email, name, ticketId, type, start, end, hours, percent,
       owner, 12000, tptLoss, actualTpt, "", "", "Closed", spareUsed,
       spareQty, spareIds.join(", "), caseNo, "", mobile
     ]]);
+    SpreadsheetApp.flush();
+    } finally {
+      lock.releaseLock();
+    }
 
     let orderedRequestId = "";
     if (orderSpare === "Yes") {
-      const ss = SpreadsheetApp.getActiveSpreadsheet();
+      const ss = getPortalSpreadsheet_();
       const materialSheet = ss.getSheetByName(SHEET_NAME);
       if (!materialSheet) throw new Error("Sheet not found: " + SHEET_NAME);
       ensureWebAppDevColumns_(materialSheet);
@@ -571,7 +745,7 @@ function sendNewMaterialRequestMail_(email,name,mobile,ticketId,requestType,item
 // =========================================================
 
 function setupStatusUpdateTrigger() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ss = getPortalSpreadsheet_();
   const sheet = ss.getSheetByName(SHEET_NAME);
 
   if (!sheet) {
@@ -1307,14 +1481,14 @@ function markInitialStatusMailSent_(sheet, row, status) {
 // =========================================================
 
 function getProblemObservationDashboardCounts_() {
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(PROBLEM_OBSERVATION_SHEET_NAME);
+  const sheet = getPortalSpreadsheet_().getSheetByName(PROBLEM_OBSERVATION_SHEET_NAME);
   if (!sheet || sheet.getLastRow() < 2) return {open:0,inProgress:0,closed:0,totalRaised:0,totalClosed:0};
   const values=sheet.getRange(2,12,sheet.getLastRow()-1,1).getValues(); let open=0,inProgress=0,closed=0;
   values.forEach(function(r){const s=String(r[0]||"Open").trim().toLowerCase();if(s==="open")open++;else if(s==="in progress")inProgress++;else if(s==="closed")closed++;});
   return {open:open,inProgress:inProgress,closed:closed,totalRaised:values.length,totalClosed:closed};
 }
 function getDashboardObservationRecent_(fromDate,toDate){
-  const sheet=SpreadsheetApp.getActiveSpreadsheet().getSheetByName(PROBLEM_OBSERVATION_SHEET_NAME);if(!sheet||sheet.getLastRow()<2)return[];
+  const sheet=getPortalSpreadsheet_().getSheetByName(PROBLEM_OBSERVATION_SHEET_NAME);if(!sheet||sheet.getLastRow()<2)return[];
   const tz=Session.getScriptTimeZone()||"Asia/Kolkata";const start=new Date(fromDate.getFullYear(),fromDate.getMonth(),fromDate.getDate());const end=new Date(toDate.getFullYear(),toDate.getMonth(),toDate.getDate()+1);const out=[];
   sheet.getRange(2,1,sheet.getLastRow()-1,19).getValues().forEach(function(r){const d=r[0] instanceof Date?r[0]:null;if(!d||d<start||d>=end||!r[1])return;out.push({timestamp:Utilities.formatDate(d,tz,"dd-MM-yyyy HH:mm"),observationId:String(r[1]||""),email:String(r[2]||""),name:String(r[3]||""),stationId:String(r[5]||""),ticketId:String(r[6]||""),category:String(r[7]||""),title:String(r[8]||""),priority:String(r[10]||""),status:String(r[11]||"Open"),mediaUrl:String(r[14]||"")});});
   out.reverse();return out.slice(0,10);
@@ -1342,7 +1516,7 @@ function getSupportOrderHeaderRow_(values) {
 }
 
 function getSupportOrderDashboardData_(toolNo, filterStart, filterEnd) {
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SUPPORT_ORDER_SHEET_NAME);
+  const sheet = getPortalSpreadsheet_().getSheetByName(SUPPORT_ORDER_SHEET_NAME);
   if (!sheet || sheet.getLastRow() < 2) return [];
 
   const requestedTool = String(toolNo || SUPPORT_ORDER_TOOL_NO).trim().toLowerCase();
@@ -1490,7 +1664,7 @@ function getSupportOrderMatchForRequest(sessionId, itemId, requestRaisedDate) {
   itemId = String(itemId || "").trim();
   if (!itemId) return { success: false, message: "Item ID is required.", found: false };
 
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SUPPORT_ORDER_SHEET_NAME);
+  const sheet = getPortalSpreadsheet_().getSheetByName(SUPPORT_ORDER_SHEET_NAME);
   if (!sheet || sheet.getLastRow() < 2) return { success: true, found: false };
 
   const values = sheet.getDataRange().getValues();
@@ -1752,7 +1926,7 @@ function getSupportOrderMatchData_(itemId, requestRaisedDate, values, headers) {
 
 function getSupportOrderMatchesForRequests_(recent) {
   if (!recent || !recent.length) return recent || [];
-  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SUPPORT_ORDER_SHEET_NAME);
+  const sh = getPortalSpreadsheet_().getSheetByName(SUPPORT_ORDER_SHEET_NAME);
   if (!sh || sh.getLastRow() < 2) return recent;
   const values = sh.getDataRange().getValues();
   const headers = values[0].map(function(h){ return String(h || "").trim().toLowerCase().replace(/\s+/g, " "); });
@@ -1764,7 +1938,7 @@ function getSupportOrderMatchesForRequests_(recent) {
 }
 
 function getDashboardData(fromDate,toDate,fromTime,toTime){
-  const sheet=SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  const sheet=getPortalSpreadsheet_().getSheetByName(SHEET_NAME);
   if(!sheet)throw new Error("Web app dev sheet not found.");
   ensureWebAppDevColumns_(sheet);
   const tz=Session.getScriptTimeZone()||"Asia/Kolkata";
@@ -1891,7 +2065,7 @@ function saveActivityNotificationConfig(sessionId, config) {
   return {success:true, message:"Activity-wise email preferences saved."};
 }
 function getConfiguredEmailRecipients_(activityKey) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ss = getPortalSpreadsheet_();
   const emailSheet = ss.getSheetByName(EMAIL_SHEET_NAME);
   let legacyTo = [], legacyCc = [];
   if (emailSheet && emailSheet.getLastRow() >= 2) {
@@ -1980,7 +2154,11 @@ function updateDashboardRequest(sessionId, ticketId, itemId, status, remark, row
   materialType = String(materialType || "").trim();
   rowNumber = Number(rowNumber || 0);
 
-  if (!ticketId) return { success: false, message: "Ticket ID is required." };
+  // New Spare Requests may not have a Ticket ID. Their dashboard row number
+  // plus Item ID identifies the selected row; other requests still require Ticket ID.
+  if (!ticketId && !(rowNumber >= 2)) {
+    return { success: false, message: "Ticket ID is required unless a valid dashboard row is selected." };
+  }
   if (!itemId) return { success: false, message: "Item ID is required." };
   if (!status) return { success: false, message: "New status is required." };
 
@@ -1990,7 +2168,7 @@ function updateDashboardRequest(sessionId, ticketId, itemId, status, remark, row
     return { success: false, message: "Invalid request status." };
   }
 
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  const sheet = getPortalSpreadsheet_().getSheetByName(SHEET_NAME);
 
   if (!sheet) {
     return { success: false, message: "Web app dev sheet not found." };
@@ -2131,12 +2309,34 @@ function updateDashboardRequest(sessionId, ticketId, itemId, status, remark, row
     currentCanonical || currentStatus
   );
 
+  // Mirror the approved status and selected Material Type to D1 after the
+  // existing Sheet/email workflow. A mirror failure must not invite a duplicate approval.
+  let d1SyncWarning = "";
+  try {
+    const updatedRow = sheet.getRange(matchedRow, 1, 1, 23).getValues()[0];
+    const requestIdForD1 = String(updatedRow[COL_REQUEST_ID - 1] || "").trim();
+    if (requestIdForD1) {
+      const allRequestRows = sheet.getRange(2, 1, lastRow - 1, 23).getValues();
+      const rowsForThisRequest = allRequestRows.filter(function(r) {
+        return String(r[COL_REQUEST_ID - 1] || "").trim() === requestIdForD1;
+      });
+      if (rowsForThisRequest.length) {
+        d1LegacySaveMaterialRequestRows_(requestIdForD1, rowsForThisRequest);
+      }
+    } else {
+      d1SyncWarning = " D1 mirror skipped because Request ID is missing.";
+    }
+  } catch (d1SyncError) {
+    console.error("D1 status/type mirror failed: " + d1SyncError.message);
+    d1SyncWarning = " Warning: Google Sheets updated, but D1 mirror failed. Please reconcile this request before retrying.";
+  }
+
   const sent = statusMailColumn && !!sheet.getRange(matchedRow, statusMailColumn).getValue();
   return {
     success: true,
-    message: sent
+    message: (sent
       ? "Request updated to '" + canonicalStatus + "' and notification sent successfully."
-      : "Request updated to '" + canonicalStatus + "'."
+      : "Request updated to '" + canonicalStatus + "'.") + d1SyncWarning
   };
 }
 
@@ -2183,7 +2383,7 @@ function searchRequests(sessionId, filters) {
   const status = String(filters.status || "").trim().toLowerCase();
   const requestType = String(filters.requestType || "").trim().toLowerCase();
 
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  const sheet = getPortalSpreadsheet_().getSheetByName(SHEET_NAME);
 
   if (!sheet) {
     return { success: false, message: "Web app dev sheet not found.", records: [] };
@@ -2305,8 +2505,7 @@ function normalizeItemMasterId_(value) {
 function getSearchItemStockMap_(sheet) {
   const stockMap = {};
 
-  const tracker = SpreadsheetApp
-    .getActiveSpreadsheet()
+  const tracker = getPortalSpreadsheet_()
     .getSheetByName(STOCK_SHEET_NAME);
 
   if (!tracker) {
@@ -2420,8 +2619,7 @@ function searchItemMaster(
   }
 
   const sheet =
-    SpreadsheetApp
-      .getActiveSpreadsheet()
+    getPortalSpreadsheet_()
       .getSheetByName(
         SEARCH_ITEM_SHEET_NAME
       );
@@ -2651,7 +2849,7 @@ function searchItemMasterFilters(sessionId, filters) {
     return { success: true, items: [] };
   }
 
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SEARCH_ITEM_SHEET_NAME);
+  const sheet = getPortalSpreadsheet_().getSheetByName(SEARCH_ITEM_SHEET_NAME);
 
   if (!sheet) {
     return { success: false, message: "Sheet not found: " + SEARCH_ITEM_SHEET_NAME, items: [] };
@@ -2767,9 +2965,40 @@ function parseReportRange_(fromDate, toDate) {
   };
 }
 
+
+function getBreakdownDashboardDetails_(sessionId, fromDate, toDate) {
+  var s=validateSession_(sessionId);
+  if(!s || String(s.role||"").toLowerCase()!=="admin") return [];
+  var range=parseReportRange_(fromDate,toDate), rs=range.start, re=range.end;
+  var sh=ensureBreakdownSheet_(), out=[];
+  if(sh.getLastRow()<2) return out;
+  var tz=Session.getScriptTimeZone()||"Asia/Kolkata";
+  sh.getRange(2,1,sh.getLastRow()-1,Math.max(22,sh.getLastColumn())).getValues().forEach(function(r){
+    var st=getReportDateValue_(r[5]), en=getReportDateValue_(r[6]);
+    if(!st||!en||en<=st) return;
+    var os=Math.max(st.getTime(),rs.getTime()), oe=Math.min(en.getTime(),re.getTime());
+    if(oe<=os) return;
+    var type=String(r[4]||"").trim();
+    if(type.toLowerCase()==="planned downtime" || type.toLowerCase()==="consumed spare recorded") return;
+    var h=getEffectiveBreakdownHours_(new Date(os),new Date(oe));
+    if(h<=0) return;
+    var loss=getBreakdownLossForRange_(r,new Date(os),new Date(oe));
+    var expected=h*Number(r[10]||12000);
+    out.push({
+      date:Utilities.formatDate(st,tz,"dd-MM-yyyy"),
+      ticketId:String(r[3]||""),
+      totalTakenTime:+h.toFixed(2),
+      issueOwner:String(r[9]||""),
+      tptLossPercent:expected>0?+(loss/expected*100).toFixed(2):0,
+      caseNo:String(r[19]||"")
+    });
+  });
+  return out.reverse().slice(0,500);
+}
+
 function getReportSummary(sessionId, fromDate, toDate) {
   requireAdminSession_(sessionId);
-  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  var sheet = getPortalSpreadsheet_().getSheetByName(SHEET_NAME);
   if (!sheet) throw new Error("Web app dev sheet not found.");
   ensureWebAppDevColumns_(sheet);
 
@@ -2815,6 +3044,7 @@ function getReportSummary(sessionId, fromDate, toDate) {
     closedReplacementScrapQty: closedReplacementScrapQty,
     operations: ops && ops.success ? ops : {},
     ownerBreakdown: owners,
+    breakdownDetails: getBreakdownDashboardDetails_(sessionId, from, to),
     fromDate: from,
     toDate: to
   };
@@ -2824,8 +3054,7 @@ function getSettings(sessionId) {
   requireAdminSession_(sessionId);
 
   const ss =
-    SpreadsheetApp
-      .getActiveSpreadsheet();
+    getPortalSpreadsheet_();
 
   const sheet =
     ss.getSheetByName(
@@ -2894,8 +3123,7 @@ function saveSettings(sessionId, data) {
   }
 
   const ss =
-    SpreadsheetApp
-      .getActiveSpreadsheet();
+    getPortalSpreadsheet_();
 
   const sheet =
     ss.getSheetByName(
@@ -3100,18 +3328,13 @@ function loginUser(
     };
   }
 
-  const ss =
-    SpreadsheetApp
-      .getActiveSpreadsheet();
+ const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
 
-  const sheet =
-    ss.getSheetByName(
-      USER_SHEET_NAME
-    );
+  const sheet = ss.getSheetByName(USER_SHEET_NAME);
 
   if (!sheet) {
     throw new Error(
-      "User Management sheet not found."
+      "User Management sheet not found in spreadsheet: " + SPREADSHEET_ID
     );
   }
 
@@ -3557,7 +3780,7 @@ function findUserByEmail_(email) {
 
   email = String(email || "").trim().toLowerCase();
 
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ss = getPortalSpreadsheet_();
   const sheet = ss.getSheetByName(USER_SHEET_NAME);
 
   if (!sheet || sheet.getLastRow() < 2) {
@@ -3741,8 +3964,7 @@ function logoutUser(
 function setupLoginHistorySheet_() {
 
   const ss =
-    SpreadsheetApp
-      .getActiveSpreadsheet();
+    getPortalSpreadsheet_();
 
   let sheet =
     ss.getSheetByName(
@@ -4106,8 +4328,7 @@ function getUserManagement(sessionId) {
   requireAdminSession_(sessionId);
 
   const ss =
-    SpreadsheetApp
-      .getActiveSpreadsheet();
+    getPortalSpreadsheet_();
 
   const sheet =
     ss.getSheetByName(
@@ -4202,8 +4423,7 @@ function saveUserManagement(
   }
 
   const ss =
-    SpreadsheetApp
-      .getActiveSpreadsheet();
+    getPortalSpreadsheet_();
 
   const sheet =
     ss.getSheetByName(
@@ -4368,7 +4588,7 @@ const PROBLEM_MEDIA_FOLDER_PROPERTY = "PROBLEM_OBSERVATION_MEDIA_FOLDER_ID";
 const PROBLEM_MEDIA_MAX_BYTES = 50 * 1024 * 1024;
 
 function ensureProblemObservationSheet_() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ss = getPortalSpreadsheet_();
   let sheet = ss.getSheetByName(PROBLEM_OBSERVATION_SHEET_NAME);
   const headers = [
     "Timestamp", "Observation ID", "Email Address", "Name", "Role",
@@ -4735,7 +4955,7 @@ function removeUserManagement(sessionId, email) {
     return { success: false, message: "The authorized recovery Admin cannot be removed." };
   }
 
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(USER_SHEET_NAME);
+  const sheet = getPortalSpreadsheet_().getSheetByName(USER_SHEET_NAME);
   if (!sheet) return { success: false, message: "User Management sheet not found." };
 
   const lastRow = sheet.getLastRow();
@@ -4772,7 +4992,7 @@ function normalizeToolNo_(value) {
 
 
 function ensureBreakdownSheet_() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ss = getPortalSpreadsheet_();
   let sheet = ss.getSheetByName(BREAKDOWN_SHEET_NAME);
 
   // FIXED BREAKDOWN SCHEMA - A:V. Never append/rename headers per submission.
@@ -4821,11 +5041,35 @@ function ensureBreakdownSheet_() {
 }
 
 
-function saveBreakdownEntry(sessionId,data){
-  const session=validateSession_(sessionId);if(!session)return{success:false,message:"Session expired. Please login again."};if(String(session.role||"").trim().toLowerCase()!=="admin")return{success:false,message:"Admin access required."};if(!data)return{success:false,message:"Breakdown data is required."};
-  const ticketId=String(data.ticketId||"").trim(),type=String(data.breakdownType||"").trim(),sv=String(data.startTime||"").trim(),ev=String(data.endTime||"").trim(),owner=String(data.issueOwner||"").trim(),spareUsed=String(data.spareUsed||"").trim(),caseNo=String(data.caseNo||"").trim(),actualTpt=Number(data.actualTpt!=null?data.actualTpt:(data.tptPerHour||0));
-  if(!ticketId)return{success:false,message:"Ticket ID is required."};if(["Planned Downtime","Partial Breakdown","Complete Breakdown"].indexOf(type)<0)return{success:false,message:"Invalid Breakdown Type."};if(!sv||!ev)return{success:false,message:"Start Time and End Time are required."};const start=new Date(sv),end=new Date(ev);if(isNaN(start)||isNaN(end)||end<=start)return{success:false,message:"Invalid start/end time."};if(type!=="Planned Downtime"&&!owner)return{success:false,message:"Issue Owner is required for Breakdown."};if(actualTpt<0||!isFinite(actualTpt))return{success:false,message:"Actual TPT During Breakdown must be zero or greater."};if(spareUsed!=="Yes"&&spareUsed!=="No")return{success:false,message:"Please select whether spare was used."};const qty=Number(data.spareConsumedQty||0),ids=String(data.spareItemIds||"").trim();if(spareUsed==="Yes"&&(qty<=0||!ids))return{success:false,message:"Spare quantity and spare item ID(s) are required when Spare Used is Yes."};
-  const hours=(end-start)/3600000,percent=(hours/24)*100,expected=hours*12000,loss=Math.max(0,expected-actualTpt),sheet=ensureBreakdownSheet_();sheet.getRange(sheet.getLastRow()+1,1,1,22).setValues([[new Date(),session.email||"",session.name||"",ticketId,type,start,end,hours,percent,owner,12000,loss,actualTpt,"","","Closed",spareUsed,spareUsed==="Yes"?qty:0,spareUsed==="Yes"?ids:"",caseNo,"",session.mobile||""]]);SpreadsheetApp.flush();return{success:true,message:type+" saved successfully."};
+function saveBreakdownEntry(sessionId, data) {
+  const session = validateSession_(sessionId);
+  if (!session) return {success:false,message:"Session expired. Please login again."};
+  if (String(session.role || "").trim().toLowerCase() !== "admin") return {success:false,message:"Admin access required."};
+  if (!data) return {success:false,message:"Breakdown data is required."};
+  const ticketId=String(data.ticketId||"").trim(), type=String(data.breakdownType||"").trim();
+  const start=new Date(String(data.startTime||"").trim()), end=new Date(String(data.endTime||"").trim());
+  const owner=String(data.issueOwner||"").trim(), spareUsed=String(data.spareUsed||"").trim();
+  const caseNo=String(data.caseNo||"").trim();
+  const actualTpt=Number(data.actualTpt!=null?data.actualTpt:(data.tptPerHour||0));
+  if(!ticketId)return{success:false,message:"Ticket ID is required."};
+  if(["Planned Downtime","Partial Breakdown","Complete Breakdown"].indexOf(type)<0)return{success:false,message:"Invalid Breakdown Type."};
+  if(isNaN(start)||isNaN(end)||end<=start)return{success:false,message:"Invalid start/end time."};
+  if(type!=="Planned Downtime"&&!owner)return{success:false,message:"Issue Owner is required for Breakdown."};
+  if(actualTpt<0||!isFinite(actualTpt))return{success:false,message:"Actual TPT During Breakdown must be zero or greater."};
+  if(spareUsed!=="Yes"&&spareUsed!=="No")return{success:false,message:"Please select whether spare was used."};
+  const qty=Number(data.spareConsumedQty||0), ids=String(data.spareItemIds||"").trim();
+  if(spareUsed==="Yes"&&(qty<=0||!ids))return{success:false,message:"Spare quantity and spare item ID(s) are required when Spare Used is Yes."};
+  const lock=LockService.getScriptLock(); lock.waitLock(30000);
+  try {
+    const sheet=ensureBreakdownSheet_(); assertUniqueBreakdownTicket_(sheet,ticketId);
+    const hours=getEffectiveBreakdownHours_(start,end);
+    if(hours<=0)return{success:false,message:"Breakdown duration is fully inside scheduled downtime (13:00-14:00 / 22:00-23:00)."};
+    const percent=(hours/24)*100, expected=hours*12000, loss=Math.max(0,expected-actualTpt);
+    sheet.getRange(sheet.getLastRow()+1,1,1,22).setValues([[new Date(),session.email||"",session.name||"",ticketId,type,start,end,hours,percent,owner,12000,loss,actualTpt,"","","Closed",spareUsed,spareUsed==="Yes"?qty:0,spareUsed==="Yes"?ids:"",caseNo,"",session.mobile||""]]);
+    SpreadsheetApp.flush();
+    return{success:true,message:type+" saved successfully."};
+  } catch(e) { return{success:false,message:e&&e.message?e.message:String(e)}; }
+  finally { lock.releaseLock(); }
 }
 
 /**
@@ -4838,63 +5082,102 @@ function saveBreakdownEntry(sessionId,data){
  *
  * Only the portion of a breakdown that overlaps the selected range is counted.
  */
+function getBreakdownLossRateFromRow_(r) {
+  // Column W is index 22 (0-based). Google Sheets percent cells
+  // return decimals such as 0.3369; plain values such as 33.69
+  // are also accepted.
+  var value = Number(r[22]);
+  if (!isFinite(value) || value < 0) return 0;
+  if (value > 1) value = value / 100;
+  return Math.min(1, value);
+}
+
 function getBreakdownDateRangeSummary(sessionId, fromDate, toDate) {
   var s = validateSession_(sessionId);
   if (!s) return {success:false, message:"Session expired. Please login again."};
-  if (String(s.role || "").toLowerCase() !== "admin") return {success:false, message:"Admin access required."};
+  if (String(s.role || "").toLowerCase() !== "admin") {
+    return {success:false, message:"Admin access required."};
+  }
 
   var tz = Session.getScriptTimeZone() || "Asia/Kolkata";
-  var range = parseReportRange_(fromDate, toDate), rs = range.start, re = range.end;
-  if (re <= rs) return {success:false, message:"To Date must be on or after From Date."};
+  var range = parseReportRange_(fromDate, toDate);
+  var rs = range.start;
+  var re = range.end;
+  if (re <= rs) {
+    return {success:false, message:"To Date must be on or after From Date."};
+  }
 
-  var breakdownHours = 0, plannedHours = 0, tptLoss = 0, records = 0, spare = 0, scheduledHours = 0;
+  var breakdownHours = 0;
+  var plannedHours = 0;
+  var tptLoss = 0;
+  var records = 0;
+  var spare = 0;
+  var scheduledHours = 0;
   var sh = ensureBreakdownSheet_();
 
   if (sh.getLastRow() >= 2) {
-    sh.getRange(2, 1, sh.getLastRow() - 1, Math.max(21, sh.getLastColumn())).getValues().forEach(function(r) {
-      var st = parseReportDate_(r[5]), en = parseReportDate_(r[6]);
-      if (!st || !en || en <= st) return;
-      var os = Math.max(st.getTime(), rs.getTime()), oe = Math.min(en.getTime(), re.getTime());
-      if (oe <= os) return;
-      var h = (oe - os) / 3600000, type = String(r[4] || "").trim();
-      if (type.toLowerCase() === "planned downtime") {
-        plannedHours += h;
-      } else {
-        breakdownHours += h;
-        records++;
-        var storedH = Number(r[7] || 0), storedLoss = Number(r[11] || 0);
-        tptLoss += storedH > 0 ? Math.max(0, storedLoss / storedH * h) : 0;
-        spare += Number(r[17] || 0);
-      }
-    });
+    sh.getRange(2, 1, sh.getLastRow() - 1, Math.max(23, sh.getLastColumn()))
+      .getValues().forEach(function(r) {
+        var st = parseReportDate_(r[5]);
+        var en = parseReportDate_(r[6]);
+        if (!st || !en || en <= st) return;
+
+        var os = Math.max(st.getTime(), rs.getTime());
+        var oe = Math.min(en.getTime(), re.getTime());
+        if (oe <= os) return;
+
+        var type = String(r[4] || "").trim();
+        var h = getEffectiveBreakdownHours_(new Date(os), new Date(oe));
+
+        if (type.toLowerCase() === "planned downtime") {
+          plannedHours += h;
+        } else {
+          breakdownHours += h;
+          records++;
+
+          // TPT Loss is stored in Column L at submission. Prorate it only
+          // when the selected report range includes part of a record.
+          tptLoss += getBreakdownLossForRange_(r, new Date(os), new Date(oe));
+          spare += Number(r[17] || 0);
+        }
+      });
   }
 
   var sd = ensureScheduledDowntimeSheet_();
   if (sd.getLastRow() >= 2) {
-    sd.getRange(2, 1, sd.getLastRow() - 1, Math.max(8, sd.getLastColumn())).getValues().forEach(function(r) {
-      var st = parseReportDate_(r[2]), en = parseReportDate_(r[3]);
-      if (!st || !en || en <= st) return;
-      var os = Math.max(st.getTime(), rs.getTime()), oe = Math.min(en.getTime(), re.getTime());
-      if (oe > os) scheduledHours += (oe - os) / 3600000;
-    });
+    sd.getRange(2, 1, sd.getLastRow() - 1, Math.max(8, sd.getLastColumn()))
+      .getValues().forEach(function(r) {
+        var st = parseReportDate_(r[2]);
+        var en = parseReportDate_(r[3]);
+        if (!st || !en || en <= st) return;
+
+        var os = Math.max(st.getTime(), rs.getTime());
+        var oe = Math.min(en.getTime(), re.getTime());
+        if (oe > os) scheduledHours += (oe - os) / 3600000;
+      });
   }
 
   var expectedBreakdownTpt = breakdownHours * 12000;
-  var lossPercent = expectedBreakdownTpt > 0 ? (tptLoss / expectedBreakdownTpt * 100) : 0;
+  var lossPercent = expectedBreakdownTpt > 0
+    ? (tptLoss / expectedBreakdownTpt * 100)
+    : 0;
 
   return {
-    success:true,
-    fromDate:Utilities.formatDate(rs,tz,"dd-MM-yyyy"),
-    toDate:Utilities.formatDate(new Date(re.getTime()-1),tz,"dd-MM-yyyy"),
-    days:Math.round((re-rs)/86400000),
-    recordCount:records,
-    totalBreakdownHours:+breakdownHours.toFixed(2),
-    plannedDowntimeHours:+plannedHours.toFixed(2),
-    scheduledDowntimeHours:+scheduledHours.toFixed(2),
-    availableHours:+Math.max(0,Math.round((re-rs)/86400000)*24-scheduledHours-plannedHours).toFixed(2),
-    breakdownPercent:+lossPercent.toFixed(2),
-    tptLoss:+tptLoss.toFixed(2),
-    spareConsumedQty:+spare.toFixed(2)
+    success: true,
+    fromDate: Utilities.formatDate(rs, tz, "dd-MM-yyyy"),
+    toDate: Utilities.formatDate(new Date(re.getTime() - 1), tz, "dd-MM-yyyy"),
+    days: Math.round((re - rs) / 86400000),
+    recordCount: records,
+    totalBreakdownHours: +breakdownHours.toFixed(2),
+    plannedDowntimeHours: +plannedHours.toFixed(2),
+    scheduledDowntimeHours: +scheduledHours.toFixed(2),
+    availableHours: +Math.max(
+      0,
+      Math.round((re - rs) / 86400000) * 24 - scheduledHours - plannedHours
+    ).toFixed(2),
+    breakdownPercent: +lossPercent.toFixed(2),
+    tptLoss: +tptLoss.toFixed(2),
+    spareConsumedQty: +spare.toFixed(2)
   };
 }
 
@@ -4914,37 +5197,61 @@ function getReportDateValue_(v){
   return null;
 }
 
-function getBreakdownOwnerSummary_(sessionId,fromDate,toDate){
-  const s=validateSession_(sessionId);
-  if(!s || String(s.role||"").toLowerCase()!=="admin") return [];
-  const sh=ensureBreakdownSheet_();
-  if(sh.getLastRow()<2) return [];
-  const a=String(fromDate||"").split("-"),b=String(toDate||"").split("-");
-  if(a.length!==3||b.length!==3) return [];
-  const rs=new Date(+a[0],+a[1]-1,+a[2]),re=new Date(+b[0],+b[1]-1,+b[2]+1);
-  if(re<=rs) return [];
-  const map={};
-  sh.getRange(2,1,sh.getLastRow()-1,Math.max(21,sh.getLastColumn())).getValues().forEach(function(r){
-    const st=getReportDateValue_(r[5]),en=getReportDateValue_(r[6]);
-    if(!st||!en||en<=st) return;
-    const os=new Date(Math.max(st.getTime(),rs.getTime())),oe=new Date(Math.min(en.getTime(),re.getTime()));
-    if(oe<=os) return;
-    const h=(oe-os)/3600000;
-    let owner=String(r[9]||"").trim().replace(/\s+/g," ");
-    if(!owner) owner="Unspecified";
-    const storedH=Number(r[7]||0),storedLoss=Number(r[11]||0);
-    const loss=storedH>0?Math.max(0,storedLoss/storedH*h):Math.max(0,storedLoss);
-    if(!map[owner]) map[owner]={hours:0,loss:0,records:0};
-    map[owner].hours+=h; map[owner].loss+=loss; map[owner].records++;
-  });
-  return Object.keys(map).sort().map(function(k){
-    const expected=map[k].hours*12000;
-    return {owner:k,hours:+map[k].hours.toFixed(2),percent:expected>0?+(map[k].loss/expected*100).toFixed(2):0,tptLoss:+map[k].loss.toFixed(2),records:map[k].records};
+function getBreakdownOwnerSummary_(sessionId, fromDate, toDate) {
+  const s = validateSession_(sessionId);
+  if (!s || String(s.role || "").toLowerCase() !== "admin") return [];
+
+  const sh = ensureBreakdownSheet_();
+  if (sh.getLastRow() < 2) return [];
+
+  const a = String(fromDate || "").split("-");
+  const b = String(toDate || "").split("-");
+  if (a.length !== 3 || b.length !== 3) return [];
+
+  const rs = new Date(+a[0], +a[1] - 1, +a[2]);
+  const re = new Date(+b[0], +b[1] - 1, +b[2] + 1);
+  if (re <= rs) return [];
+
+  const map = {};
+  sh.getRange(2, 1, sh.getLastRow() - 1, Math.max(23, sh.getLastColumn()))
+    .getValues().forEach(function(r) {
+      const st = getReportDateValue_(r[5]);
+      const en = getReportDateValue_(r[6]);
+      if (!st || !en || en <= st) return;
+
+      const os = Math.max(st.getTime(), rs.getTime());
+      const oe = Math.min(en.getTime(), re.getTime());
+      if (oe <= os) return;
+
+      const h = getEffectiveBreakdownHours_(new Date(os), new Date(oe));
+      if (String(r[4] || "").trim().toLowerCase() === "planned downtime" || h <= 0) return;
+      let owner = String(r[9] || "").trim().replace(/\s+/g, " ");
+      if (!owner) owner = "Unspecified";
+
+      const loss = getBreakdownLossForRange_(r, new Date(os), new Date(oe));
+
+      if (!map[owner]) map[owner] = {hours: 0, loss: 0, records: 0};
+      map[owner].hours += h;
+      map[owner].loss += loss;
+      map[owner].records++;
+    });
+
+  return Object.keys(map).sort().map(function(k) {
+    const expected = map[k].hours * 12000;
+    return {
+      owner: k,
+      hours: +map[k].hours.toFixed(2),
+      percent: expected > 0
+        ? +(map[k].loss / expected * 100).toFixed(2)
+        : 0,
+      tptLoss: +map[k].loss.toFixed(2),
+      records: map[k].records
+    };
   });
 }
 
 function ensureReceivedSpareSheet_(){
-  const ss=SpreadsheetApp.getActiveSpreadsheet();
+  const ss=getPortalSpreadsheet_();
   let sh=ss.getSheetByName(RECEIVED_SPARE_SHEET_NAME);
   const headers=[
     "Timestamp","Received Date","Received Time","Received Against","Request / Ticket ID",
@@ -5074,7 +5381,7 @@ function getReceivedSpareRecords(sessionId,fromDate,toDate){
 // =========================================================
 
 function getPVCBeltSpreadsheet_() {
-  return SpreadsheetApp.getActiveSpreadsheet() || SpreadsheetApp.openById(SPREADSHEET_ID);
+  return getPortalSpreadsheet_() || SpreadsheetApp.openById(SPREADSHEET_ID);
 }
 
 function ensurePVCBeltReceivedSheet_() {
@@ -5250,7 +5557,7 @@ function getPVCBeltRecords(sessionId, months) {
   };
 }
 
-function ensureScheduledDowntimeSheet_(){const ss=SpreadsheetApp.getActiveSpreadsheet();let sh=ss.getSheetByName(SCHEDULED_DOWNTIME_SHEET_NAME);const h=["Timestamp","Date","From Time","To Time","Ticket No.","Work Details","Work Done By","Duration (hrs)"];if(!sh)sh=ss.insertSheet(SCHEDULED_DOWNTIME_SHEET_NAME);if(sh.getLastRow()===0)sh.getRange(1,1,1,h.length).setValues([h]);else{const cur=sh.getRange(1,1,1,Math.max(sh.getLastColumn(),h.length)).getValues()[0];h.forEach(function(v,i){if(!String(cur[i]||"").trim())sh.getRange(1,i+1).setValue(v);});}return sh;}
+function ensureScheduledDowntimeSheet_(){const ss=getPortalSpreadsheet_();let sh=ss.getSheetByName(SCHEDULED_DOWNTIME_SHEET_NAME);const h=["Timestamp","Date","From Time","To Time","Ticket No.","Work Details","Work Done By","Duration (hrs)"];if(!sh)sh=ss.insertSheet(SCHEDULED_DOWNTIME_SHEET_NAME);if(sh.getLastRow()===0)sh.getRange(1,1,1,h.length).setValues([h]);else{const cur=sh.getRange(1,1,1,Math.max(sh.getLastColumn(),h.length)).getValues()[0];h.forEach(function(v,i){if(!String(cur[i]||"").trim())sh.getRange(1,i+1).setValue(v);});}return sh;}
 function saveScheduledDowntime(sessionId,data){
   requirePortalPermission_(sessionId, "maintenance", "create");
 const s=validateSession_(sessionId);if(!s)return{success:false,message:"Session expired. Please login again."};data=data||{};const d=String(data.date||"").trim(),ticket=String(data.ticketNo||"").trim(),ft=String(data.fromTime||"").trim(),tt=String(data.toTime||"").trim(),work=String(data.workDetails||"").trim(),by=String(data.workDoneBy||"").trim();if(!d||!ticket||!ft||!tt||!work||!by)return{success:false,message:"Date, Ticket No., From Time, To Time, Work Details and Work Done By are required."};const st=new Date(d+"T"+ft),en=new Date(d+"T"+tt);if(isNaN(st)||isNaN(en)||en<=st)return{success:false,message:"To Time must be after From Time."};const h=(en-st)/3600000;ensureScheduledDowntimeSheet_().getRange(ensureScheduledDowntimeSheet_().getLastRow()+1,1,1,8).setValues([[new Date(),new Date(d+"T00:00:00"),st,en,ticket,work,by,h]]);try{sendConfiguredPortalNotice_("scheduledDowntime","Scheduled Downtime Activity","Scheduled downtime saved by "+String(s.name||s.email)+". Date: "+d+", Ticket: "+ticket+", Work: "+work+", Duration: "+h+" hours.");}catch(mailError){Logger.log("Scheduled downtime notification failed: "+mailError.message);}return{success:true,message:"Scheduled downtime saved successfully."};}
@@ -5296,7 +5603,8 @@ function doPost(e) {
       submitRequest: submitRequest,
       updateDashboardRequest: updateDashboardRequest,
       updateProblemObservation: updateProblemObservation,
-      verifyAdminRecovery: verifyAdminRecovery
+      verifyAdminRecovery: verifyAdminRecovery,
+      syncPMChecklistFromDailyWork: syncPMChecklistFromDailyWork,
     };
 
     if (!handlers[fn]) {
@@ -5390,126 +5698,285 @@ function pmDateISO_(value) {
   if (dt.getFullYear() !== y || dt.getMonth() !== mo || dt.getDate() !== d) return "";
   return Utilities.formatDate(dt, tz, "yyyy-MM-dd");
 }
-function getPMChecklist(sessionId) {
-  requirePortalPermission_(sessionId,"maintenance","view");
-  const ss=SpreadsheetApp.openById(PM_CHECKLIST_SPREADSHEET_ID_);
-  const tz=Session.getScriptTimeZone()||"Asia/Kolkata";
-  const today=Utilities.formatDate(new Date(),tz,"yyyy-MM-dd");
-  const rows=[];
-  let foundDateTabs=0;
-  ss.getSheets().forEach(function(sh){
-    // Each date has its own tab, e.g. "11 Jan 2026" or "09 Jan 2026".
-    const tabDate=pmDateISO_(sh.getName());
-    if(!tabDate) return;
-    foundDateTabs++;
-    const values=sh.getDataRange().getValues();
-    let headerIndex=-1, headers=[];
-    for(let r=0;r<Math.min(values.length,30);r++){
-      const h=values[r].map(pmNormHeader_);
-      if(h.indexOf("module")>=0 && h.indexOf("component")>=0 && (h.indexOf("checkpoint")>=0||h.indexOf("check point")>=0)){
-        headerIndex=r;headers=values[r];break;
+
+
+function getPMChecklist(sessionId, requestedMonth) {
+  requirePortalPermission_(sessionId, "maintenance", "view");
+
+  var tz = Session.getScriptTimeZone() || "Asia/Kolkata";
+  var today = Utilities.formatDate(new Date(), tz, "yyyy-MM-dd");
+  var month = String(requestedMonth || "all").trim() || "all";
+
+  var api;
+
+  try {
+    api = d1LegacyRequest_("/api/pm-checklist/list", {
+      month: month,
+      filter: "all",
+      limit: 10000,
+      offset: 0
+    });
+  } catch (err) {
+    return {
+      success: false,
+      rows: [],
+      today: today,
+      dateTabsFound: 0,
+      message: "D1 se PM Checklist load nahi hui: " +
+        (err.message || err)
+    };
+  }
+
+  if (!api || api.success !== true) {
+    return {
+      success: false,
+      rows: [],
+      today: today,
+      dateTabsFound: 0,
+      message: (api && api.message) ||
+        "D1 PM Checklist API error."
+    };
+  }
+
+  var rawRows = Array.isArray(api.rows) ? api.rows :
+    (Array.isArray(api.data) ? api.data :
+    (Array.isArray(api.records) ? api.records : []));
+
+  function value_(obj, camel, snake, fallback) {
+    if (obj[camel] !== undefined && obj[camel] !== null) {
+      return obj[camel];
+    }
+
+    if (obj[snake] !== undefined && obj[snake] !== null) {
+      return obj[snake];
+    }
+
+    return fallback;
+  }
+
+  var rows = rawRows.map(function(r) {
+    var rawDue = value_(r, "dueDate", "due_date", "");
+    var dueDate = pmDateISO_(rawDue) ||
+      String(rawDue || "").slice(0, 10);
+
+    var condition = String(
+      value_(r, "condition", "condition", "") || ""
+    ).trim();
+
+    var rawEta = value_(r, "eta", "eta", "");
+
+    var etaISO = pmDateISO_(
+      value_(r, "etaISO", "eta_iso", rawEta)
+    ) || String(
+      value_(r, "etaISO", "eta_iso", "") || ""
+    ).slice(0, 10);
+
+    var eta = String(rawEta || etaISO || "");
+
+    if (/^\d{4}-\d{2}-\d{2}$/.test(eta)) {
+      var parsed = new Date(eta + "T12:00:00");
+
+      if (!isNaN(parsed.getTime())) {
+        eta = Utilities.formatDate(
+          parsed,
+          tz,
+          "dd-MMM-yyyy"
+        );
       }
     }
-    if(headerIndex<0) return;
-    const ix={
-      module:pmFindHeader_(headers,["Module"]),
-      component:pmFindHeader_(headers,["Component"]),
-      checkpoint:pmFindHeader_(headers,["CheckPoint","Check Point"]),
-      frequency:pmFindHeader_(headers,["Frequency"]),
-      correction:pmFindHeader_(headers,["Correction method","Issue / Correction","Issue Description"]),
-      issue:pmFindHeader_(headers,["Issue Description"]),
-      // Per user's sheet, Condition is Column P (1-based).
-      condition:15,
-      eta:pmFindHeader_(headers,["ETA","Next Planned Date","Next Planned","Planned Date"])
+
+    var statusFallback =
+      condition.toLowerCase() === "ok"
+        ? "Completed"
+        : "Open";
+
+    return {
+      id: Number(value_(r, "id", "id", 0)) || 0,
+
+      sheetId: Number(
+        value_(r, "sheetId", "source_sheet_id", 0)
+      ) || 0,
+
+      sheetName: String(
+        value_(r, "sheetName", "source_sheet_name", "") || ""
+      ),
+
+      rowNumber: Number(
+        value_(r, "rowNumber", "source_row_number", 0)
+      ) || 0,
+
+      module: String(value_(r, "module", "module", "") || ""),
+      component: String(value_(r, "component", "component", "") || ""),
+      checkpoint: String(value_(r, "checkpoint", "checkpoint", "") || ""),
+      frequency: String(value_(r, "frequency", "frequency", "") || ""),
+
+      dueDate: dueDate,
+      dueDates: dueDate ? [dueDate] : [],
+      isDueToday: dueDate === today,
+
+      condition: condition,
+
+      status: String(
+        value_(r, "status", "status", statusFallback) ||
+        statusFallback
+      ),
+
+      issueDescription: String(
+        value_(r, "issueDescription", "issue_description", "") || ""
+      ),
+
+      correctionMethod: String(
+        value_(r, "correctionMethod", "correction_method", "") || ""
+      ),
+
+      eta: eta,
+      etaISO: etaISO
     };
-    for(let r=headerIndex+1;r<values.length;r++){
-      const row=values[r];
-      const module=ix.module>=0?row[ix.module]:"";
-      const component=ix.component>=0?row[ix.component]:"";
-      const checkpoint=ix.checkpoint>=0?row[ix.checkpoint]:"";
+  
+}).filter(function(r) {
+  var combined = [
+    r.module,
+    r.component,
+    r.checkpoint
+  ].join(" ").toLowerCase();
 
-      // Exclude navigation/link rows such as "Go to Main Sheet".
-      // Search the entire row because the label may be in Module or a hyperlink cell,
-      // and the visible text can include an icon/emoji.
-      const navRowText = row.map(function(v) {
-        return String(v == null ? "" : v).replace(/\s+/g, " ").trim().toLowerCase();
-      }).join(" ");
-      const taskFieldsBlank =
-        !String(module || "").trim() &&
-        !String(component || "").trim() &&
-        !String(checkpoint || "").trim();
-      const isNavigationRow =
-        /go\s+to\s+main\s+sheet/.test(navRowText) ||
-        /click\s+here\s+to\s+go\s+to\s+main\s+sheet/.test(navRowText) ||
-        /back\s+to\s+main\s+sheet/.test(navRowText) ||
-        (taskFieldsBlank && /\b(main sheet|home|back)\b/.test(navRowText));
-      if (isNavigationRow) continue;
+  var isNavigationRow =
+    combined.indexOf("go to main sheet") !== -1 ||
+    combined.indexOf("main sheet") !== -1;
 
-      // A real checklist point must have at least one task-identifying field.
-      if (taskFieldsBlank) continue;
-      const condition=String(row[ix.condition]||"").trim();
-      const status=condition.toLowerCase()==="ok"?"Completed":"Open";
-      const eta=ix.eta>=0?row[ix.eta]:"";
-      rows.push({
-        sheetId:sh.getSheetId(),sheetName:sh.getName(),rowNumber:r+1,
-        module:String(module||""),component:String(component||""),checkpoint:String(checkpoint||""),
-        frequency:ix.frequency>=0?String(row[ix.frequency]||"").trim():"",
-        dueDate:tabDate,dueDates:[tabDate],isDueToday:tabDate===today,
-        condition:condition,status:status,
-        issueDescription:ix.issue>=0?String(row[ix.issue]||""):"",
-        correctionMethod:ix.correction>=0?String(row[ix.correction]||""):"",
-        eta:eta instanceof Date?Utilities.formatDate(eta,tz,"dd-MMM-yyyy"):String(eta||""),
-        etaISO:pmDateISO_(eta)
-      });
-    }
+  return !!r.dueDate &&
+    !!(r.module || r.component || r.checkpoint) &&
+    !isNavigationRow;
+});
+
+
+  rows.sort(function(a, b) {
+    return a.dueDate.localeCompare(b.dueDate) ||
+      a.rowNumber - b.rowNumber;
   });
-  if(!foundDateTabs) return {success:false,message:"No date-named tabs were detected. Expected names like 11 Jan 2026. Check the exact tab names and confirm this deployment is connected to the correct spreadsheet."};
-  rows.sort(function(a,b){return a.dueDate.localeCompare(b.dueDate)||a.rowNumber-b.rowNumber;});
-  return {success:true,rows:rows,today:today,dateTabsFound:foundDateTabs,message:"Detected "+foundDateTabs+" date tabs; loaded "+rows.length+" checklist points."};
+
+  var total = Number(
+    api.total !== undefined
+      ? api.total
+      : (api.pagination &&
+         api.pagination.total !== undefined
+          ? api.pagination.total
+          : rawRows.length)
+  );
+
+  // Check actual API records, not filtered display rows.
+  if (total > rawRows.length) {
+    return {
+      success: false,
+      rows: rows,
+      today: today,
+      dateTabsFound: 0,
+      message: "D1 API ne " + rawRows.length +
+        " of " + total +
+        " records bheje. API pagination check karein."
+    };
+  }
+
+  return {
+    success: true,
+    rows: rows,
+    today: today,
+    dateTabsFound: 0,
+    message: "D1 se " + rows.length +
+      " PM Checklist points load hue."
+  };
 }
-function savePMChecklistRow(sessionId,sheetIdOrRowNumber,rowNumberOrCondition,conditionOrEta,maybeEta) {
-  const session=requirePortalPermission_(sessionId,"maintenance","edit");
-  // Supports both the current frontend signature (sessionId, sheetId, rowNumber, condition, eta)
-  // and the older signature (sessionId, rowNumber, condition, eta).
-  let targetSheetId=0,rowNum,cleanCondition,cleanEta;
-  if(arguments.length>=5){
-    targetSheetId=Number(sheetIdOrRowNumber)||0;
-    rowNum=Number(rowNumberOrCondition);
-    cleanCondition=String(conditionOrEta||"").trim();
-    cleanEta=String(maybeEta||"").trim();
+
+function savePMChecklistRow(sessionId, sheetIdOrRowNumber, rowNumberOrCondition, conditionOrEta, maybeEta) {
+  const session = requirePortalPermission_(sessionId, "maintenance", "edit");
+  let targetSheetId = 0, rowNum, cleanCondition, cleanEta;
+
+  if (arguments.length >= 5) {
+    targetSheetId = Number(sheetIdOrRowNumber) || 0;
+    rowNum = Number(rowNumberOrCondition);
+    cleanCondition = String(conditionOrEta || "").trim();
+    cleanEta = String(maybeEta || "").trim();
   } else {
-    rowNum=Number(sheetIdOrRowNumber);
-    cleanCondition=String(rowNumberOrCondition||"").trim();
-    cleanEta=String(conditionOrEta||"").trim();
+    rowNum = Number(sheetIdOrRowNumber);
+    cleanCondition = String(rowNumberOrCondition || "").trim();
+    cleanEta = String(conditionOrEta || "").trim();
   }
-  if(!Number.isInteger(rowNum)||rowNum<2)throw new Error("Invalid PM checklist row.");
-  if(["","OK","Not OK"].indexOf(cleanCondition)<0)throw new Error("Condition must be OK or Not OK.");
-  if(cleanCondition!=="OK"&&!cleanEta)throw new Error("ETA / next planned date is required while the task is open.");
-  const ss=SpreadsheetApp.openById(PM_CHECKLIST_SPREADSHEET_ID_);
-  let sh=null, headerRow=0, headers=null;
-  if(targetSheetId){
-    sh=ss.getSheets().find(function(s){return Number(s.getSheetId())===targetSheetId;})||null;
-  }
-  if(!sh){
-    ss.getSheets().some(function(s){const data=s.getDataRange().getValues();for(let r=0;r<Math.min(data.length,30);r++){const h=data[r].map(pmNormHeader_);if(h.indexOf("module")>=0&&h.indexOf("component")>=0&&(h.indexOf("checkpoint")>=0||h.indexOf("check point")>=0)){sh=s;headerRow=r+1;headers=data[r];return true;}}return false;});
-  } else {
-    const data=sh.getDataRange().getValues();
-    for(let r=0;r<Math.min(data.length,30);r++){
-      const h=data[r].map(pmNormHeader_);
-      if(h.indexOf("module")>=0&&h.indexOf("component")>=0&&(h.indexOf("checkpoint")>=0||h.indexOf("check point")>=0)){headerRow=r+1;headers=data[r];break;}
+
+  if (!Number.isInteger(rowNum) || rowNum < 2) throw new Error("Invalid PM checklist row.");
+  if (["", "OK", "Not OK"].indexOf(cleanCondition) < 0) throw new Error("Condition must be OK or Not OK.");
+  if (cleanCondition !== "OK" && !cleanEta) throw new Error("ETA / next planned date is required while the task is open.");
+
+  const tz = Session.getScriptTimeZone() || "Asia/Kolkata";
+  let etaISO = "";
+  if (cleanEta) {
+    etaISO = pmDateISO_(cleanEta);
+    if (!etaISO) {
+      const parsed = new Date(cleanEta);
+      if (!isNaN(parsed.getTime())) etaISO = Utilities.formatDate(parsed, tz, "yyyy-MM-dd");
     }
+    if (!etaISO) throw new Error("ETA date format is invalid.");
   }
-  if(!sh)throw new Error("PM header row not found.");
-  if(!headers||!headerRow)throw new Error("PM header row not found in selected sheet.");
-  if(rowNum<=headerRow)throw new Error("Selected row is not a task row.");
-  // Condition is explicitly stored in Column P of the source sheet.
-  sh.getRange(rowNum,16).setValue(cleanCondition);
-  let ei=pmFindHeader_(headers,["ETA","Next Planned Date","Next Planned","Planned Date"]);
-  if(ei<0){ei=headers.length;sh.getRange(headerRow,ei+1).setValue("ETA / Next Planned Date");}
-  sh.getRange(rowNum,ei+1).setValue(cleanEta?new Date(cleanEta+"T12:00:00"): "");
-  try { const pmEventKey=cleanCondition==="OK"?"pmWorkCompleted":"pmWorkOpen"; sendConfiguredPortalNotice_(pmEventKey,cleanCondition==="OK"?"PM Work Completed":"PM Work Open / Pending","Task row "+rowNum+" updated by "+String(session.name||session.email)+". Condition: "+(cleanCondition||"Open")+". ETA: "+(cleanEta||"Not set")+"."); } catch(mailError) { Logger.log("PM notification failed: "+mailError.message); }
-  return {success:true,message:"PM checklist updated in source sheet."};
+
+  // Resolve the actual source tab by its sheet ID; do not silently use the first tab.
+  const ss = SpreadsheetApp.openById(PM_CHECKLIST_SPREADSHEET_ID_);
+  let sh = targetSheetId
+    ? ss.getSheets().find(function(tab) { return Number(tab.getSheetId()) === targetSheetId; }) || null
+    : null;
+  if (!sh) {
+    if (targetSheetId) throw new Error("PM Checklist source tab not found for sheet ID " + targetSheetId + ".");
+    sh = ss.getSheets()[0] || null;
+  }
+  if (!sh) throw new Error("PM Checklist source sheet not found.");
+
+  const header = pmFindChecklistHeader_(sh);
+  if (!header) throw new Error("PM Checklist header row not found.");
+  if (rowNum <= header.row || rowNum > sh.getLastRow()) throw new Error("PM Checklist row is outside the task data range.");
+
+  const width = Math.max(sh.getLastColumn(), header.headers.length);
+  const conditionCol = pmFindHeader_(header.headers, ["Condition"]);
+  if (conditionCol < 0) throw new Error("Condition column not found in PM Checklist source sheet.");
+  let etaCol = pmFindHeader_(header.headers, ["ETA", "Next Planned Date", "Next Planned", "Planned Date"]);
+  if (etaCol < 0) {
+    etaCol = width;
+    sh.getRange(header.row, etaCol + 1).setValue("ETA / Next Planned Date");
+  }
+
+  // Mirror the user edit to the source sheet first, then send this single row to D1.
+  sh.getRange(rowNum, conditionCol + 1).setValue(cleanCondition);
+  sh.getRange(rowNum, etaCol + 1).setValue(etaISO ? new Date(etaISO + "T12:00:00") : "");
+  SpreadsheetApp.flush();
+
+  const values = sh.getRange(rowNum, 1, 1, Math.max(sh.getLastColumn(), header.headers.length)).getValues()[0];
+  const payload = pmChecklistRowPayload_(sh, rowNum, header.headers, values);
+  payload.condition = cleanCondition;
+  payload.status = cleanCondition === "OK" ? "Completed" : "Open";
+  payload.eta = etaISO;
+  payload.eta_iso = etaISO;
+  payload.source_sheet_id = sh.getSheetId();
+  payload.source_sheet_name = sh.getName();
+  payload.source_row_number = rowNum;
+
+  // Incremental single-row write; no full-table list/read and no deletion.
+  const updated = d1LegacyRequest_("/api/pm-checklist/sync-batch", {
+    source_sheet_id: sh.getSheetId(),
+    source_sheet_name: sh.getName(),
+    rows: [payload]
+  });
+  if (!updated || updated.success !== true) {
+    throw new Error("D1 sync failed for PM Checklist row " + rowNum + ".");
+  }
+
+  try {
+    const eventKey = cleanCondition === "OK" ? "pmWorkCompleted" : "pmWorkOpen";
+    sendConfiguredPortalNotice_(eventKey, cleanCondition === "OK" ? "PM Work Completed" : "PM Work Open / Pending",
+      "Task row " + rowNum + " updated by " + (session.name || session.email) + ".");
+  } catch (mailError) {
+    Logger.log("PM Checklist notification warning: " + mailError);
+  }
+
+  return { success: true, d1Updated: true, sheetMirrorUpdated: true, message: "PM Checklist successfully updated." };
 }
+
 function getT3004ShiftRoster(sessionId) {
   requirePortalPermission_(sessionId,"shiftRoster","view");
   const ss=SpreadsheetApp.openById(T3004_ROSTER_SPREADSHEET_ID_);
@@ -5725,4 +6192,964 @@ function sendPMOverdueNotifications() {
     }
     if(overdue.length)sendConfiguredPortalNotice_("pmWorkOverdue","PM Work Overdue ("+overdue.length+")",overdue.join("\n"));
   } catch(err) { Logger.log("PM overdue notification failed: "+err.message); }
+}
+
+// =========================================================
+// PM CHECKLIST GOOGLE SHEET -> D1 SYNC
+// SAFE MODE: on-edit only. No daily full-sheet sync trigger is installed.
+// =========================================================
+const PM_D1_BATCH_SIZE_ = 40;
+const PM_D1_SYNC_STATE_KEY_ = "PM_CHECKLIST_D1_SYNC_STATE_V2";
+
+function setupPMChecklistD1SyncTrigger() {
+  const ss = SpreadsheetApp.openById(PM_CHECKLIST_SPREADSHEET_ID_);
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    const name = t.getHandlerFunction();
+    if (name === "pmChecklistD1OnEdit" || name === "startPMChecklistDailySync" ||
+        name === "continuePMChecklistFullToD1_") ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger("pmChecklistD1OnEdit")
+    .forSpreadsheet(ss)
+    .onEdit()
+    .create();
+  return "PM Checklist on-edit trigger installed. Daily full sync remains disabled.";
+}
+
+// Run manually for the first full sync. Safe to rerun; it upserts rows and does not delete existing D1 data.
+function syncPMChecklistFullToD1() {
+  return startPMChecklistDailySync();
+}
+
+function startPMChecklistDailySync() {
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty(PM_D1_SYNC_STATE_KEY_, JSON.stringify({ sheetIndex: 0, nextRow: 1, startedAt: new Date().toISOString() }));
+  pmScheduleContinuation_();
+  return continuePMChecklistFullToD1_();
+}
+
+function pmScheduleContinuation_() {
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    if (t.getHandlerFunction() === "continuePMChecklistFullToD1_") ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger("continuePMChecklistFullToD1_").timeBased().after(60 * 1000).create();
+}
+
+function pmStopContinuation_() {
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    if (t.getHandlerFunction() === "continuePMChecklistFullToD1_") ScriptApp.deleteTrigger(t);
+  });
+}
+
+function pmFindChecklistHeader_(sh) {
+  const scanRows = Math.min(Math.max(sh.getLastRow(), 1), 30);
+  const scanCols = Math.max(sh.getLastColumn(), 1);
+  const data = sh.getRange(1, 1, scanRows, scanCols).getValues();
+  for (let i = 0; i < data.length; i++) {
+    const h = data[i].map(pmNormHeader_);
+    if (h.indexOf("module") >= 0 && h.indexOf("component") >= 0 &&
+        (h.indexOf("checkpoint") >= 0 || h.indexOf("check point") >= 0)) {
+      return { row: i + 1, headers: data[i] };
+    }
+  }
+  return null;
+}
+
+
+// Strict header lookup for PM checklist columns. This avoids accidentally
+// treating a similarly named column as Status or Condition.
+function pmChecklistFindColumn_(headers, names) {
+  const normalize = function(value) {
+    return String(value == null ? "" : value)
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+  };
+  const normalized = headers.map(normalize);
+  const candidates = names.map(normalize);
+
+  // Exact header matches first.
+  for (let i = 0; i < candidates.length; i++) {
+    const index = normalized.indexOf(candidates[i]);
+    if (index >= 0) return index;
+  }
+
+  // Then accept a longer header beginning with the requested field name.
+  for (let i = 0; i < candidates.length; i++) {
+    const index = normalized.findIndex(function(header) {
+      return header && header.indexOf(candidates[i]) === 0;
+    });
+    if (index >= 0) return index;
+  }
+  return -1;
+}
+
+
+function pmChecklistRowPayload_(sh, rowNumber, headers, row) {
+  const ix = function(names) {
+    return pmFindHeader_(headers, names);
+  };
+
+  const get = function(names) {
+    const i = ix(names);
+    return i >= 0 && i < row.length ? row[i] : "";
+  };
+
+  const module = String(get(["Module"]) || "").trim();
+  const component = String(get(["Component"]) || "").trim();
+  const checkpoint = String(get(["Checkpoint", "CheckPoint", "Check Point"]) || "").trim();
+
+  // Condition header missing ho toh column P (16) use karo.
+  let conditionIndex = ix(["Condition"]);
+  if (conditionIndex < 0) conditionIndex = 15;
+
+  const condition = String(
+    conditionIndex < row.length ? row[conditionIndex] || "" : ""
+  ).trim();
+
+  const statusRaw = String(get(["Status"]) || "").trim();
+
+  let due = pmDateISO_(get(["Due Date", "Date"]));
+  if (!due) due = pmDateISO_(sh.getName());
+
+  const etaRaw = get(["ETA", "Next Planned Date", "Next Planned", "Planned Date"]);
+  const etaISO = pmDateISO_(etaRaw);
+
+  const safeHeaders = headers.map(function(h, i) {
+    return String(h == null || h === "" ? "Column " + (i + 1) : h);
+  });
+
+  const safeValues = row.map(function(v) {
+    if (v instanceof Date && !isNaN(v.getTime())) return v.toISOString();
+    return v == null ? "" : v;
+  });
+
+  return {
+    source_sheet_id: sh.getSheetId(),
+    source_sheet_name: sh.getName(),
+    source_row_number: rowNumber,
+    due_date: due,
+    module: module,
+    component: component,
+    checkpoint: checkpoint,
+    frequency: String(get(["Frequency"]) || "").trim(),
+    condition: condition,
+    status: statusRaw || (condition.toUpperCase() === "OK" ? "Completed" : "Open"),
+    issue_description: String(get(["Issue Description", "Issue"]) || "").trim(),
+    correction_method: String(get(["Correction Method", "Correction", "Corrective Action"]) || "").trim(),
+    eta: etaISO || String(etaRaw || "").trim(),
+    eta_iso: etaISO,
+    row_json: {
+      headers: safeHeaders,
+      values: safeValues
+    }
+  };
+}
+
+
+function continuePMChecklistFullToD1_() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) {
+    pmScheduleContinuation_();
+    return { success: false, message: "Another PM sync batch is running; next batch scheduled." };
+  }
+
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const rawState = props.getProperty(PM_D1_SYNC_STATE_KEY_);
+    if (!rawState) {
+      pmStopContinuation_();
+      return { success: true, complete: true, message: "No pending full sync." };
+    }
+
+    pmScheduleContinuation_();
+    const state = JSON.parse(rawState);
+    const ss = SpreadsheetApp.openById(PM_CHECKLIST_SPREADSHEET_ID_);
+    const sheets = ss.getSheets();
+    let sheetIndex = Math.max(0, Number(state.sheetIndex) || 0);
+    let nextRow = Math.max(1, Number(state.nextRow) || 1);
+    let rowsScanned = 0;
+    let openRowsQueued = 0;
+    const maxRows = PM_D1_BATCH_SIZE_;
+
+    while (sheetIndex < sheets.length && rowsScanned < maxRows) {
+      const sh = sheets[sheetIndex];
+      const header = pmFindChecklistHeader_(sh);
+      if (!header) {
+        sheetIndex++;
+        nextRow = 1;
+        continue;
+      }
+
+      const lastRow = sh.getLastRow();
+      if (nextRow <= header.row) nextRow = header.row + 1;
+      if (nextRow > lastRow) {
+        sheetIndex++;
+        nextRow = 1;
+        continue;
+      }
+
+      const width = Math.max(sh.getLastColumn(), header.headers.length);
+      const take = Math.min(maxRows - rowsScanned, lastRow - nextRow + 1);
+      const values = sh.getRange(nextRow, 1, take, width).getValues();
+      const payloadRows = [];
+
+      for (let i = 0; i < values.length; i++) {
+        const rowNumber = nextRow + i;
+        const rowValues = values[i];
+        const payload = pmChecklistRowPayload_(sh, rowNumber, header.headers, rowValues);
+        const hasAnyData = rowValues.some(function (v) {
+          return v !== "" && v !== null;
+        });
+
+        // Full sync sends only rows whose status is exactly "Open".
+        // Completed and all other statuses are omitted from this request.
+        if (!hasAnyData || String(payload.status || "").trim() !== "Open") continue;
+
+        // Keep all columns, including manually edited and future columns.
+        payload.row_json = {
+          headers: header.headers.map(function (h, j) {
+            return String(h === null || h === undefined || h === "" ? ("Column " + (j + 1)) : h);
+          }),
+          values: rowValues.map(function (v) {
+            if (v instanceof Date && !isNaN(v.getTime())) return v.toISOString();
+            return v === null || v === undefined ? "" : v;
+          })
+        };
+        payload.source_sheet_id = String(sh.getSheetId());
+        payload.source_sheet_name = sh.getName();
+        payload.source_row_number = rowNumber;
+        payloadRows.push(payload);
+      }
+
+      if (payloadRows.length) {
+        const result = d1LegacyRequest_("/api/pm-checklist/sync-batch", {
+          sync_mode: "full",
+          source_sheet_id: String(sh.getSheetId()),
+          source_sheet_name: sh.getName(),
+          rows: payloadRows
+        });
+        if (!result || result.success !== true) {
+          throw new Error("D1 full-sync batch failed for sheet " + sh.getName() + ": " + JSON.stringify(result || {}));
+        }
+        openRowsQueued += payloadRows.length;
+      }
+
+      rowsScanned += take;
+      nextRow += take;
+      if (nextRow > lastRow) {
+        sheetIndex++;
+        nextRow = 1;
+      }
+    }
+
+    if (sheetIndex >= sheets.length) {
+      props.deleteProperty(PM_D1_SYNC_STATE_KEY_);
+      pmStopContinuation_();
+      return {
+        success: true,
+        complete: true,
+        rowsScannedThisRun: rowsScanned,
+        openRowsQueuedThisRun: openRowsQueued,
+        message: "PM Checklist full sync batch completed (Open rows only)."
+      };
+    }
+
+    props.setProperty(PM_D1_SYNC_STATE_KEY_, JSON.stringify({
+      sheetIndex: sheetIndex,
+      nextRow: nextRow,
+      startedAt: state.startedAt || new Date().toISOString()
+    }));
+
+    return {
+      success: true,
+      complete: false,
+      rowsScannedThisRun: rowsScanned,
+      openRowsQueuedThisRun: openRowsQueued,
+      nextSheetIndex: sheetIndex,
+      nextRow: nextRow,
+      message: "Open-row batch sent; continuation scheduled."
+    };
+  } catch (err) {
+    Logger.log("PM Checklist full sync batch failed: " + (err && err.stack ? err.stack : err));
+    pmScheduleContinuation_();
+    throw err;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function pmChecklistD1OnEdit(e) {
+  if (!e || !e.range) return;
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    throw new Error("PM Checklist D1 sync is busy. Please retry the edit shortly.");
+  }
+
+  try {
+    const sh = e.range.getSheet();
+    const header = pmFindChecklistHeader_(sh);
+    if (!header) return;
+
+    const firstEditedRow = e.range.getRow();
+    const lastEditedRow = firstEditedRow + e.range.getNumRows() - 1;
+    const rowStart = Math.max(firstEditedRow, header.row + 1);
+    if (rowStart > lastEditedRow) return;
+
+    const width = Math.max(sh.getLastColumn(), header.headers.length);
+    const rows = [];
+
+    for (let rowNum = rowStart; rowNum <= lastEditedRow; rowNum++) {
+      const values = sh.getRange(rowNum, 1, 1, width).getValues()[0];
+      const hasTask = values.some(function(value) {
+        return value !== "" && value !== null;
+      });
+      if (!hasTask) continue;
+
+      const payload = pmChecklistRowPayload_(sh, rowNum, header.headers, values);
+      if (!(payload.module || payload.component || payload.checkpoint)) continue;
+
+      payload.source_sheet_id = String(sh.getSheetId());
+      payload.source_sheet_name = sh.getName();
+      payload.source_row_number = rowNum;
+      payload.row_json = {
+        headers: header.headers.map(function(h, i) {
+          return String(h === null || h === undefined || h === ""
+            ? "Column " + (i + 1) : h);
+        }),
+        values: values.map(function(value) {
+          if (value instanceof Date && !isNaN(value.getTime())) return value.toISOString();
+          return value === null || value === undefined ? "" : value;
+        })
+      };
+      rows.push(payload);
+    }
+
+    if (!rows.length) return;
+
+    for (let i = 0; i < rows.length; i += 100) {
+      const chunk = rows.slice(i, i + 100);
+      const result = d1LegacyRequest_("/api/pm-checklist/sync-batch", {
+        source_sheet_id: String(sh.getSheetId()),
+        source_sheet_name: sh.getName(),
+        rows: chunk
+      });
+
+      if (!result || result.success !== true ||
+          Number(result.synced || 0) !== chunk.length) {
+        throw new Error(
+          "PM Checklist D1 sync mismatch for " + sh.getName() +
+          ". Expected " + chunk.length + ", received " +
+          Number(result && result.synced || 0) +
+          ". Response: " + JSON.stringify(result || {})
+        );
+      }
+    }
+
+    Logger.log("PM CHECKLIST D1 SYNC OK: " + JSON.stringify(rows.map(function(r) {
+      return { row: r.source_row_number, condition: r.condition, status: r.status };
+    })));
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function importPMChecklistBatchToStage() {
+  const ss = SpreadsheetApp.openById(PM_CHECKLIST_SPREADSHEET_ID_);
+  const props = PropertiesService.getScriptProperties();
+  const cursorKey = "PM_CHECKLIST_STAGE_IMPORT_CURSOR_V1";
+  const functionName = "importPMChecklistBatchToStage";
+
+  const state = JSON.parse(
+    props.getProperty(cursorKey) ||
+    JSON.stringify({ sheetIndex: 0, nextRow: 1 })
+  );
+
+  const sheets = ss.getSheets();
+  let sheetIndex = Math.max(0, Number(state.sheetIndex) || 0);
+  let nextRow = Math.max(1, Number(state.nextRow) || 1);
+
+  let scanned = 0;
+  let rowsSent = 0;
+  let rowsWithoutTaskFields = 0;
+  const details = [];
+  const batchSize = 90;
+
+  while (sheetIndex < sheets.length && scanned < batchSize) {
+    const sh = sheets[sheetIndex];
+    const header = pmFindChecklistHeader_(sh);
+
+    if (!header) {
+      sheetIndex++;
+      nextRow = 1;
+      continue;
+    }
+
+    const lastRow = sh.getLastRow();
+
+    if (nextRow <= header.row) nextRow = header.row + 1;
+
+    if (nextRow > lastRow) {
+      sheetIndex++;
+      nextRow = 1;
+      continue;
+    }
+
+    const width = Math.max(sh.getLastColumn(), header.headers.length);
+    const take = Math.min(batchSize - scanned, lastRow - nextRow + 1);
+    const values = sh.getRange(nextRow, 1, take, width).getValues();
+    const rows = [];
+
+    for (let i = 0; i < values.length; i++) {
+      const rowNumber = nextRow + i;
+      const row = values[i];
+
+      if (!row.some(v => v !== "" && v !== null)) continue;
+
+      const payload = pmChecklistRowPayload_(
+        sh, rowNumber, header.headers, row
+      );
+
+      if (!(payload.module || payload.component || payload.checkpoint)) {
+        rowsWithoutTaskFields++;
+        continue;
+      }
+
+      payload.source_sheet_id = String(sh.getSheetId());
+      payload.source_sheet_name = sh.getName();
+      payload.source_row_number = rowNumber;
+
+      payload.row_json = {
+        headers: header.headers.map((v, i) =>
+          String(v === null || v === undefined || v === ""
+            ? "Column " + (i + 1) : v)
+        ),
+        values: row.map(v =>
+          v instanceof Date && !isNaN(v.getTime())
+            ? v.toISOString()
+            : (v === null || v === undefined ? "" : v)
+        )
+      };
+
+      rows.push(payload);
+    }
+
+    let response = null;
+
+    if (rows.length) {
+      response = d1LegacyRequest_(
+        "/api/pm-checklist/stage-batch",
+        {
+          source_sheet_id: String(sh.getSheetId()),
+          source_sheet_name: sh.getName(),
+          rows: rows
+        }
+      );
+
+      if (!response || response.success !== true) {
+        throw new Error(
+          "Stage import failed for " + sh.getName() +
+          ": " + JSON.stringify(response || {})
+        );
+      }
+
+      rowsSent += rows.length;
+    }
+
+    details.push({
+      sheet: sh.getName(),
+      firstRow: nextRow,
+      scanned: take,
+      payloadRows: rows.length,
+      response: response
+    });
+
+    scanned += take;
+    nextRow += take;
+
+    if (nextRow > lastRow) {
+      sheetIndex++;
+      nextRow = 1;
+    }
+  }
+
+  const complete = sheetIndex >= sheets.length;
+
+  if (complete) {
+    props.deleteProperty(cursorKey);
+  } else {
+    props.setProperty(cursorKey, JSON.stringify({
+      sheetIndex: sheetIndex,
+      nextRow: nextRow
+    }));
+  }
+
+  // Schedule exactly one continuation trigger, or remove it at completion.
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === functionName)
+    .forEach(t => ScriptApp.deleteTrigger(t));
+
+  if (!complete) {
+    ScriptApp.newTrigger(functionName)
+      .timeBased()
+      .after(60 * 800)
+      .create();
+  }
+
+  const report = {
+    success: true,
+    complete: complete,
+    scannedThisRun: scanned,
+    rowsSentThisRun: rowsSent,
+    rowsWithoutTaskFields: rowsWithoutTaskFields,
+    nextSheetIndex: sheetIndex,
+    nextRow: nextRow,
+    details: details,
+    message: complete
+      ? "Staging import completed."
+      : "Next batch automatically scheduled."
+  };
+
+  Logger.log("PM STAGE IMPORT REPORT: " + JSON.stringify(report));
+  return report;
+}
+function installPMChecklistOnEditOnly() {
+  return setupPMChecklistD1SyncTrigger();
+}
+
+function testPMChecklistRow3Mapping() {
+  const ss = SpreadsheetApp.openById(PM_CHECKLIST_SPREADSHEET_ID_);
+  const sh = ss.getSheetByName("11 Nov 2026");
+  if (!sh) throw new Error("Sheet not found");
+
+  const header = pmFindChecklistHeader_(sh);
+  const width = sh.getLastColumn();
+
+  console.log(JSON.stringify({
+    sheetLastColumn: width,
+    detectedHeaderRow: header ? header.row : null,
+    detectedHeaders: header ? header.headers.map((v, i) => ({
+      column: i + 1,
+      header: String(v)
+    })) : [],
+    row3Values: sh.getRange(3, 1, 1, width).getDisplayValues()[0]
+      .map((v, i) => ({
+        column: i + 1,
+        value: v
+      }))
+  }, null, 2));
+}
+/*
+PM CHECKLIST -> CLOUDFLARE D1 LIVE SYNC + DELETE SUPPORT
+
+HOW TO APPLY:
+1) Keep your existing large Apps Script project intact.
+2) Paste this ENTIRE file at the VERY END of the existing Code.gs project.
+3) These function declarations intentionally override the older PM versions.
+4) Run setupPMChecklistD1SyncTrigger() ONCE and authorize it.
+5) Do NOT run startPMChecklistDailySync(), continuePMChecklistFullToD1_(),
+   syncPMChecklistFullToD1(), or any stage reset for this fix.
+
+Assumes these existing project functions/constants are present:
+- PM_CHECKLIST_SPREADSHEET_ID_
+- d1LegacyRequest_(path, payload)
+- pmNormHeader_(value), pmFindHeader_(headers, candidates), pmDateISO_(value)
+*/
+
+function setupPMChecklistD1SyncTrigger() {
+  var ss = SpreadsheetApp.openById(PM_CHECKLIST_SPREADSHEET_ID_);
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    var name = t.getHandlerFunction();
+    if (name === "pmChecklistD1OnEdit" || name === "pmChecklistD1OnChange" ||
+        name === "startPMChecklistDailySync" || name === "continuePMChecklistFullToD1_") {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+
+  ScriptApp.newTrigger("pmChecklistD1OnEdit").forSpreadsheet(ss).onEdit().create();
+  ScriptApp.newTrigger("pmChecklistD1OnChange").forSpreadsheet(ss).onChange().create();
+
+  // Deliberately no daily full-sync trigger. The stage-import trigger is untouched.
+  return "PM Checklist live sync installed: onEdit + onChange; daily full sync disabled.";
+}
+
+function pmChecklistFindHeaderLocal_(sh) {
+  var scanRows = Math.min(Math.max(sh.getLastRow(), 1), 30);
+  var scanCols = Math.max(sh.getLastColumn(), 1);
+  var data = sh.getRange(1, 1, scanRows, scanCols).getValues();
+  for (var i = 0; i < data.length; i++) {
+    var h = data[i].map(pmNormHeader_);
+    if (h.indexOf("module") >= 0 && h.indexOf("component") >= 0 &&
+        (h.indexOf("checkpoint") >= 0 || h.indexOf("check point") >= 0)) {
+      return { row: i + 1, headers: data[i] };
+    }
+  }
+  return null;
+}
+
+function pmChecklistRowPayload_(sh, rowNumber, headers, row) {
+  function ix(names) { return pmFindHeader_(headers, names); }
+  function get(names) {
+    var i = ix(names);
+    return i >= 0 && i < row.length ? row[i] : "";
+  }
+
+  var module = String(get(["Module"]) || "").trim();
+  var component = String(get(["Component"]) || "").trim();
+  var checkpoint = String(get(["Checkpoint", "CheckPoint", "Check Point"]) || "").trim();
+
+  // In the current PM sheet, P (column 16) contains Condition but row-2 header is blank.
+  var conditionIndex = ix(["Condition"]);
+  if (conditionIndex < 0 && row.length >= 16) conditionIndex = 15;
+  var condition = String(conditionIndex >= 0 && conditionIndex < row.length ? (row[conditionIndex] || "") : "").trim();
+
+  var statusRaw = String(get(["Status"]) || "").trim();
+  var due = pmDateISO_(get(["Due Date", "Date"]));
+  if (!due) due = pmDateISO_(sh.getName());
+  var etaRaw = get(["ETA", "Next Planned Date", "Next Planned", "Planned Date"]);
+  var etaISO = pmDateISO_(etaRaw);
+
+  var safeHeaders = headers.map(function(h, i) {
+    return String(h === null || h === undefined || h === "" ? ("Column " + (i + 1)) : h);
+  });
+  var safeValues = row.map(function(v) {
+    if (v instanceof Date && !isNaN(v.getTime())) return v.toISOString();
+    return v === null || v === undefined ? "" : v;
+  });
+
+  return {
+    source_sheet_id: sh.getSheetId(),
+    source_sheet_name: sh.getName(),
+    source_row_number: rowNumber,
+    due_date: due,
+    module: module,
+    component: component,
+    checkpoint: checkpoint,
+    frequency: String(get(["Frequency"]) || "").trim(),
+    condition: condition,
+    status: statusRaw || (condition.toUpperCase() === "OK" ? "Completed" : "Open"),
+    issue_description: String(get(["Issue Description", "Issue"]) || "").trim(),
+    correction_method: String(get(["Correction Method", "Correction", "Corrective Action"]) || "").trim(),
+    eta: etaISO || String(etaRaw || "").trim(),
+    eta_iso: etaISO,
+    row_json: { headers: safeHeaders, values: safeValues }
+  };
+}
+
+
+function pmChecklistHasTaskIdentity_(payload) {
+  var module = String(payload.module || "").trim().toLowerCase();
+  var component = String(payload.component || "").trim().toLowerCase();
+  var checkpoint = String(payload.checkpoint || "").trim().toLowerCase();
+
+  // Ignore navigation/link rows.
+  var combined = [module, component, checkpoint].join(" ");
+
+  if (
+    combined.indexOf("go to main sheet") !== -1 ||
+    combined.indexOf("main sheet") !== -1
+  ) {
+    return false;
+  }
+
+  return !!(module || component || checkpoint);
+}
+
+
+function pmChecklistD1OnEdit(e) {
+  if (!e || !e.range) return;
+  var sh = e.range.getSheet();
+  var header = pmChecklistFindHeaderLocal_(sh);
+  if (!header) return;
+
+  var firstTaskRow = header.row + 1;
+  var firstRow = Math.max(e.range.getRow(), firstTaskRow);
+  var lastRow = e.range.getRow() + e.range.getNumRows() - 1;
+  if (firstRow > lastRow) return;
+
+  var width = Math.max(sh.getLastColumn(), header.headers.length, 16);
+  var rowsToSync = [];
+  var deletedCount = 0;
+
+  for (var rowNum = firstRow; rowNum <= lastRow; rowNum++) {
+    var values = sh.getRange(rowNum, 1, 1, width).getValues()[0];
+    var payload = pmChecklistRowPayload_(sh, rowNum, header.headers, values);
+
+    // Clearing the complete task identity removes its D1 record.
+    // Clearing only Condition/ETA/another field keeps the record and syncs the blank field.
+    if (!pmChecklistHasTaskIdentity_(payload)) {
+      var del = d1LegacyRequest_("/api/pm-checklist/delete-row", {
+        source_sheet_id: sh.getSheetId(),
+        source_row_number: rowNum
+      });
+      deletedCount += Number(del.deleted || 0);
+      continue;
+    }
+    rowsToSync.push(payload);
+  }
+
+  for (var i = 0; i < rowsToSync.length; i += 100) {
+    d1LegacyRequest_("/api/pm-checklist/sync-batch", {
+      source_sheet_id: sh.getSheetId(),
+      source_sheet_name: sh.getName(),
+      rows: rowsToSync.slice(i, i + 100)
+    });
+  }
+  Logger.log("PM Checklist edit sync: updated=" + rowsToSync.length + ", deleted=" + deletedCount);
+}
+
+function pmChecklistBuildSheetSnapshot_(sh) {
+  var header = pmChecklistFindHeaderLocal_(sh);
+  if (!header) return null;
+
+  var lastRow = sh.getLastRow();
+  var width = Math.max(sh.getLastColumn(), header.headers.length, 16);
+  var snapshot = [];
+  if (lastRow <= header.row) return { header: header, rows: snapshot };
+
+  var values = sh.getRange(header.row + 1, 1, lastRow - header.row, width).getValues();
+  for (var i = 0; i < values.length; i++) {
+    var rowNum = header.row + 1 + i;
+    var payload = pmChecklistRowPayload_(sh, rowNum, header.headers, values[i]);
+    if (!pmChecklistHasTaskIdentity_(payload)) continue;
+    snapshot.push(payload);
+  }
+  return { header: header, rows: snapshot };
+}
+
+function pmChecklistReconcileSheetToD1_(sh) {
+  var built = pmChecklistBuildSheetSnapshot_(sh);
+  if (!built) return { success: false, skipped: true, reason: "Checklist header not found." };
+  if (built.rows.length > 500) {
+    throw new Error("Sheet " + sh.getName() + " has " + built.rows.length +
+      " task rows; safe reconciliation endpoint limit is 500. No D1 changes were made.");
+  }
+
+  var result = d1LegacyRequest_("/api/pm-checklist/sync-sheet", {
+    source_sheet_id: sh.getSheetId(),
+    source_sheet_name: sh.getName(),
+    rows: built.rows
+  });
+  Logger.log("PM Checklist sheet reconciliation: " + sh.getName() +
+    ", current rows=" + built.rows.length + ", replaced=" + result.deletedAndReplaced);
+  return result;
+}
+
+function pmChecklistD1OnChange(e) {
+  if (!e) return;
+  var type = String(e.changeType || "");
+  if (type !== "REMOVE_ROW" && type !== "INSERT_ROW") return;
+
+  var ss = e.source || SpreadsheetApp.openById(PM_CHECKLIST_SPREADSHEET_ID_);
+  var sh = ss.getActiveSheet();
+  if (!sh) throw new Error("Could not identify active sheet after row change.");
+  var result = pmChecklistReconcileSheetToD1_(sh);
+  Logger.log("PM Checklist onChange " + type + ": " + JSON.stringify(result));
+}
+
+
+function syncSelectedMonthToD1() {
+
+  // Yahan sirf month change karein: YYYY-MM
+  const selectedMonth = "2026-11";
+
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(selectedMonth)) {
+    throw new Error("Invalid month: " + selectedMonth);
+  }
+
+  const ss = SpreadsheetApp.openById(PM_CHECKLIST_SPREADSHEET_ID_);
+  const sheets = ss.getSheets();
+
+  let sheetsSynced = 0;
+  let rowsSynced = 0;
+  let rowsSkipped = 0;
+
+  const matchingSheets = sheets.filter(function(sh) {
+    return pmGetSheetMonthKey_(sh.getName()) === selectedMonth;
+  });
+
+  if (!matchingSheets.length) {
+    throw new Error("No sheet tabs found for " + selectedMonth);
+  }
+
+  for (const sh of matchingSheets) {
+    const header = pmFindChecklistHeader_(sh);
+
+    if (!header) {
+      Logger.log("Skipped: header not found - " + sh.getName());
+      continue;
+    }
+
+    const lastRow = sh.getLastRow();
+    if (lastRow <= header.row) continue;
+
+    const width = Math.max(sh.getLastColumn(), header.headers.length);
+    const values = sh.getRange(
+      header.row + 1, 1,
+      lastRow - header.row, width
+    ).getValues();
+
+    const payloadRows = [];
+
+    values.forEach(function(row, index) {
+      const rowNumber = header.row + 1 + index;
+
+      const hasData = row.some(function(v) {
+        return v !== "" && v !== null;
+      });
+
+      if (!hasData) {
+        rowsSkipped++;
+        return;
+      }
+
+      const payload = pmChecklistRowPayload_(
+        sh, rowNumber, header.headers, row
+      );
+
+      payload.source_sheet_id = String(sh.getSheetId());
+      payload.source_sheet_name = sh.getName();
+      payload.source_row_number = rowNumber;
+
+      payload.row_json = {
+        headers: header.headers.map(function(h, i) {
+          return String(
+            h === null || h === undefined || h === ""
+              ? "Column " + (i + 1) : h
+          );
+        }),
+        values: row.map(function(v) {
+          if (v instanceof Date && !isNaN(v.getTime())) {
+            return v.toISOString();
+          }
+          return v === null || v === undefined ? "" : v;
+        })
+      };
+
+      payloadRows.push(payload);
+    });
+
+    // Replace only this sheet's D1 records with current Sheet data
+const result = d1LegacyRequest_(
+  "/api/pm-checklist/sync-sheet",
+  {
+    source_sheet_id: String(sh.getSheetId()),
+    source_sheet_name: sh.getName(),
+    rows: payloadRows
+  }
+);
+
+if (!result || result.success !== true) {
+  throw new Error(
+    "Snapshot sync failed for " + sh.getName() + ": " +
+    JSON.stringify(result || {})
+  );
+}
+
+rowsSynced += payloadRows.length;
+
+    sheetsSynced++;
+
+    Logger.log(
+      "Synced " + sh.getName() +
+      " | Rows: " + payloadRows.length
+    );
+  }
+
+  const summary = {
+    success: true,
+    month: selectedMonth,
+    sheetsSynced: sheetsSynced,
+    rowsSynced: rowsSynced,
+    blankRowsSkipped: rowsSkipped
+  };
+
+  Logger.log(JSON.stringify(summary, null, 2));
+
+  return summary;
+}
+
+
+// Month helper — included in the same code
+function pmGetSheetMonthKey_(sheetName) {
+
+  const match = String(sheetName).trim().match(
+    /^\d{1,2}\s+([A-Za-z]+)\s+(\d{4})$/
+  );
+
+  if (!match) return "";
+
+  const months = {
+    jan: "01", january: "01",
+    feb: "02", february: "02",
+    mar: "03", march: "03",
+    apr: "04", april: "04",
+    may: "05",
+    jun: "06", june: "06",
+    jul: "07", july: "07",
+    aug: "08", august: "08",
+    sep: "09", sept: "09", september: "09",
+    oct: "10", october: "10",
+    nov: "11", november: "11",
+    dec: "12", december: "12"
+  };
+
+  const month = months[match[1].toLowerCase()];
+  if (!month) return "";
+
+  return match[2] + "-" + month;
+}
+
+/**
+ * Called by Daily Work Sheet project through existing Web App API.
+ * Updates the affected PM Checklist rows in Cloudflare D1.
+ */
+function syncPMChecklistFromDailyWork(
+  token,
+  sheetName,
+  firstRow,
+  numRows
+) {
+  var props = PropertiesService.getScriptProperties();
+  var savedToken = String(
+    props.getProperty("PM_DAILY_WORK_SYNC_TOKEN") || ""
+  ).trim();
+
+  if (!savedToken || String(token || "") !== savedToken) {
+    throw new Error("Unauthorized Daily Work sync request.");
+  }
+
+  var row = Number(firstRow);
+  var count = Number(numRows);
+  var name = String(sheetName || "").trim();
+
+  if (!name || !Number.isInteger(row) || row < 1 ||
+      !Number.isInteger(count) || count < 1) {
+    throw new Error("Invalid sheet name or row information.");
+  }
+
+  var ss = SpreadsheetApp.openById(PM_CHECKLIST_SPREADSHEET_ID_);
+  var sh = ss.getSheetByName(name);
+
+  if (!sh) {
+    throw new Error("PM sheet not found: " + name);
+  }
+
+  if (row + count - 1 > sh.getMaxRows()) {
+    throw new Error("Requested row range exceeds sheet limits.");
+  }
+
+  // PM Checklist's existing D1 sync handler reads the complete affected rows.
+  var range = sh.getRange(row, 15, count, 6);
+
+  pmChecklistD1OnEdit({
+    range: range
+  });
+
+  return {
+    success: true,
+    sheetName: name,
+    firstRow: row,
+    rowsProcessed: count
+  };
 }
