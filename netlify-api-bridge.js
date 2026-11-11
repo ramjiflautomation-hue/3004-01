@@ -1,101 +1,105 @@
-
 (function () {
   "use strict";
 
   var gasEndpoint = "/api/gas-api";
   var pmEndpoint = "/api/pm-checklist";
+  var REQUEST_TIMEOUT_MS = 55000;
 
   var googleShim = window.google = window.google || {};
   googleShim.script = googleShim.script || {};
 
-  var runner = {
-    _success: function () {},
-    _failure: function () {},
+  // Give every google.script.run chain its own handlers.
+  // This prevents simultaneous API calls from sharing success/failure callbacks.
+  function createRunner() {
+    var successHandler = function () {};
+    var failureHandler = function () {};
 
-    withSuccessHandler: function (fn) {
-      this._success = typeof fn === "function"
-        ? fn
-        : function () {};
-      return this;
-    },
-
-    withFailureHandler: function (fn) {
-      this._failure = typeof fn === "function"
-        ? fn
-        : function () {};
-      return this;
-    }
-  };
-
-  googleShim.script.run = new Proxy(runner, {
-    get: function (target, property) {
-      if (property in target) return target[property];
-
-      if (
-        typeof property !== "string" ||
-        property.charAt(0) === "_"
-      ) {
-        return undefined;
+    var runner = {
+      withSuccessHandler: function (fn) {
+        successHandler = typeof fn === "function" ? fn : function () {};
+        return proxy;
+      },
+      withFailureHandler: function (fn) {
+        failureHandler = typeof fn === "function" ? fn : function () {};
+        return proxy;
       }
+    };
 
-      return function () {
-        var args = Array.prototype.slice.call(arguments);
-        var success = target._success;
-        var failure = target._failure;
+    var proxy = new Proxy(runner, {
+      get: function (target, property) {
+        if (property in target) return target[property];
+        if (typeof property !== "string" || property.charAt(0) === "_") {
+          return undefined;
+        }
 
-        target._success = function () {};
-        target._failure = function () {};
+        return function () {
+          var args = Array.prototype.slice.call(arguments);
+          var onSuccess = successHandler;
+          var onFailure = failureHandler;
+          var endpoint =
+            property === "getPMChecklist" || property === "savePMChecklistRow"
+              ? pmEndpoint
+              : gasEndpoint;
 
-        var endpoint =
-          property === "getPMChecklist" ||
-          property === "savePMChecklistRow"
-            ? pmEndpoint
-            : gasEndpoint;
+          var controller = new AbortController();
+          var timeoutId = setTimeout(function () {
+            controller.abort();
+          }, REQUEST_TIMEOUT_MS);
 
-        fetch(endpoint, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            fn: property,
-            args: args
+          fetch(endpoint, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Accept": "application/json"
+            },
+            cache: "no-store",
+            credentials: "same-origin",
+            body: JSON.stringify({ fn: property, args: args }),
+            signal: controller.signal
           })
-        })
-          .then(function (response) {
-            return response.text().then(function (text) {
-              var result;
+            .then(function (response) {
+              return response.text().then(function (text) {
+                var result;
+                try {
+                  result = JSON.parse(text);
+                } catch (parseError) {
+                  throw new Error(
+                    "API returned invalid JSON (HTTP " + response.status + "): " +
+                    text.slice(0, 500)
+                  );
+                }
 
-              try {
-                result = JSON.parse(text);
-              } catch (error) {
-                throw new Error(
-                  "API HTTP " + response.status + ": " +
-                  text.slice(0, 1000)
-                );
-              }
-
-              if (!response.ok) {
-                throw new Error(
-                  "API HTTP " + response.status + ": " +
-                  (result.message || result.details || text)
-                );
-              }
-
-              return result;
+                if (!response.ok) {
+                  throw new Error(
+                    "API HTTP " + response.status + ": " +
+                    (result && (result.message || result.details) || text)
+                  );
+                }
+                return result;
+              });
+            })
+            .then(function (result) {
+              onSuccess(result);
+            })
+            .catch(function (error) {
+              var message = error && error.name === "AbortError"
+                ? "API request timed out after " + Math.round(REQUEST_TIMEOUT_MS / 1000) + " seconds."
+                : (error && error.message ? error.message : String(error));
+              onFailure({ message: message });
+            })
+            .finally(function () {
+              clearTimeout(timeoutId);
             });
-          })
-          .then(function (result) {
-            success(result);
-          })
-          .catch(function (error) {
-            failure({
-              message: error && error.message
-                ? error.message
-                : String(error)
-            });
-          });
-      };
-    }
+        };
+      }
+    });
+
+    return proxy;
+  }
+
+  Object.defineProperty(googleShim.script, "run", {
+    configurable: true,
+    enumerable: true,
+    get: createRunner
   });
 })();
