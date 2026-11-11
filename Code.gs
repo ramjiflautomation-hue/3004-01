@@ -5579,6 +5579,7 @@ function doPost(e) {
       addUserManagement: addUserManagement,
       getBreakdownDateRangeSummary: getBreakdownDateRangeSummary,
       getBreakdownRecords: getBreakdownRecords,
+      getReportSummary: getReportSummary,
       getCurrentUser: getCurrentUser,
       getDashboardData: getDashboardData,
       getLoginHistory: getLoginHistory,
