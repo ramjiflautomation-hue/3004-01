@@ -1433,6 +1433,33 @@
       #portalLoadingOverlay .portal-spinner { animation-duration: 1.8s; }
     }
 
+  
+    /* Compact dashboard breakdown detail table */
+    #page-dashboard .breakdown-dashboard-table {
+      width:100%;
+      min-width:0 !important;
+      table-layout:fixed;
+      font-size:12px;
+    }
+    #page-dashboard .breakdown-dashboard-table th,
+    #page-dashboard .breakdown-dashboard-table td {
+      padding:8px 9px;
+      white-space:normal;
+      overflow-wrap:anywhere;
+    }
+    #page-dashboard .breakdown-dashboard-table th:nth-child(1),
+    #page-dashboard .breakdown-dashboard-table td:nth-child(1) { width:13%; }
+    #page-dashboard .breakdown-dashboard-table th:nth-child(2),
+    #page-dashboard .breakdown-dashboard-table td:nth-child(2) { width:22%; }
+    #page-dashboard .breakdown-dashboard-table th:nth-child(3),
+    #page-dashboard .breakdown-dashboard-table td:nth-child(3) { width:17%; }
+    #page-dashboard .breakdown-dashboard-table th:nth-child(4),
+    #page-dashboard .breakdown-dashboard-table td:nth-child(4) { width:18%; }
+    #page-dashboard .breakdown-dashboard-table th:nth-child(5),
+    #page-dashboard .breakdown-dashboard-table td:nth-child(5) { width:14%; }
+    #page-dashboard .breakdown-dashboard-table th:nth-child(6),
+    #page-dashboard .breakdown-dashboard-table td:nth-child(6) { width:16%; }
+
   </style>
 </head>
 
@@ -2434,8 +2461,7 @@
           <div class="stat-card"><div class="label">TPT / Loss</div><div class="value" id="reportTptLoss">₹0.00</div></div>
           <div class="stat-card"><div class="label">Spare Consumed</div><div class="value" id="reportSpareConsumed">0.00</div></div>
         </div>
-        <div class="panel"><div class="panel-header"><h3>Breakdown by Owner</h3><button class="btn btn-light btn-small" onclick="loadReportSummary()">Refresh</button></div><div class="panel-body"><div class="table-wrap"><table class="data-table"><thead><tr><th>Owner</th><th>Breakdown Hours</th><th>TPT Loss %</th><th>TPT / Loss</th></tr></thead><tbody id="reportOwnerBody"><tr><td colspan="4" class="loading">Select report dates.</td></tr></tbody></table></div></div></div>
-        <div class="panel"><div class="panel-header"><h3>Selected Period Breakdown Details</h3></div><div class="panel-body"><p style="font-size:13px;color:#6b7280;margin:0;">Scheduled Downtime and Planned Downtime are shown separately and are not counted as TPT loss. TPT Loss is calculated from the breakdown duration, fixed TPT of ₹12,000/hour and Actual TPT During Breakdown entered at submission.</p></div></div>
+        <div class="panel"><div class="panel-header"><h3>Selected Period Breakdown Details</h3></div><div class="panel-body"><div class="table-wrap"><table class="data-table breakdown-dashboard-table"><thead><tr><th>Date</th><th>Ticket ID</th><th>Total Taken Time (hrs)</th><th>Issue Owner</th><th>TPT Loss %</th><th>Case No.</th></tr></thead><tbody id="reportBreakdownDetailsBody"><tr><td colspan="6" class="loading">Select report dates.</td></tr></tbody></table></div><p style="font-size:12px;color:#6b7280;margin:12px 0 0;">Planned Downtime is excluded from Breakdown Hours and TPT Loss. Fixed Scheduled Downtime (13:00–14:00 and 22:00–23:00) is also excluded from breakdown duration.</p></div></div>
       </section>
 
       <!-- SETTINGS -->
@@ -3944,6 +3970,13 @@
             return '<tr><td>'+escapeHtml(r.owner||"")+'</td><td>'+Number(r.hours||0).toFixed(2)+'</td><td>'+Number(r.percent||0).toFixed(2)+'%</td><td>₹'+Number(r.tptLoss||0).toLocaleString("en-IN",{minimumFractionDigits:2})+'</td></tr>';
           }).join(""):'<tr><td colspan="4" class="loading">No breakdown records found for the selected dates.</td></tr>';
         }
+        const detailBody=document.getElementById("reportBreakdownDetailsBody");
+        const detailRows=data.breakdownDetails||[];
+        if(detailBody){
+          detailBody.innerHTML=detailRows.length?detailRows.map(function(r){
+            return '<tr><td>'+escapeHtml(r.date||"")+'</td><td>'+escapeHtml(r.ticketId||"")+'</td><td>'+Number(r.totalTakenTime||0).toFixed(2)+'</td><td>'+escapeHtml(r.issueOwner||"")+'</td><td>'+Number(r.tptLossPercent||0).toFixed(2)+'%</td><td>'+escapeHtml(r.caseNo||"")+'</td></tr>';
+          }).join(""):'<tr><td colspan="6" class="loading">No breakdown records found for the selected dates.</td></tr>';
+        }
       })
       .withFailureHandler(function(error){
         if(window.hidePortalLoading) window.hidePortalLoading();
@@ -4617,6 +4650,290 @@
   function escapeAttribute(value) {
     return escapeHtml(value);
   }
+
+  /* =========================================================
+     MATERIAL REQUEST FORM HANDLERS
+     ========================================================= */
+  function handleMaterialRequestModeChange() {
+    const typeEl = document.getElementById("requestType");
+    const type = typeEl ? typeEl.value : "";
+    const panelIds = ["breakdownSubmissionPanel", "newSpareRequestPanel", "consumedSpareRequestPanel"];
+    panelIds.forEach(function(id) {
+      const el = document.getElementById(id);
+      if (el) el.style.display = "none";
+    });
+    const map = {
+      "Breakdown Submission": "breakdownSubmissionPanel",
+      "New Spare Request": "newSpareRequestPanel",
+      "Consumed Spare Details": "consumedSpareRequestPanel"
+    };
+    if (map[type]) {
+      const panel = document.getElementById(map[type]);
+      if (panel) panel.style.display = "block";
+    }
+    if (type === "New Spare Request") {
+      const rows = document.getElementById("newSpareRows");
+      if (rows && !rows.children.length) addNewSpareRow();
+    }
+    if (type === "Consumed Spare Details") {
+      const rows = document.getElementById("standaloneConsumedRows");
+      if (rows && !rows.children.length) addStandaloneConsumedRow();
+    }
+    if (type === "Breakdown Submission") {
+      const rows = document.getElementById("breakdownSpareRows");
+      if (rows && !rows.children.length) addBreakdownSpareRow();
+    }
+    const msg = document.getElementById("submitMessage");
+    if (msg) { msg.textContent = ""; msg.className = "message"; }
+  }
+
+  function materialRequestCommonData() {
+    return {
+      sessionId: currentSessionId,
+      email: (document.getElementById("requestEmail") || {}).value || (currentUser && currentUser.email) || "",
+      name: (document.getElementById("requestName") || {}).value || (currentUser && currentUser.name) || "",
+      mobile: (document.getElementById("requestMobile") || {}).value || (currentUser && currentUser.mobile) || ""
+    };
+  }
+
+  function materialRequestMessage(message, ok) {
+    const el = document.getElementById("submitMessage");
+    if (!el) { alert(message); return; }
+    el.className = "message " + (ok ? "success" : "error");
+    el.textContent = message || (ok ? "Submitted successfully." : "Submission failed.");
+    el.style.display = "block";
+  }
+
+  function addNewSpareRow(item) {
+    const body = document.getElementById("newSpareRows"); if (!body) return;
+    const row = document.createElement("div");
+    row.className = "form-grid-3";
+    row.style.marginTop = "10px";
+    row.innerHTML = '<div class="form-group"><label>Item ID *</label><input class="form-control new-spare-id" placeholder="Item ID"></div>' +
+      '<div class="form-group"><label>Spare Name</label><input class="form-control new-spare-name" placeholder="Spare name"></div>' +
+      '<div class="form-group"><label>Qty *</label><input type="number" min="0.01" step="0.01" class="form-control new-spare-qty" placeholder="Qty"></div>' +
+      '<div class="form-group"><label>Tool No.</label><input class="form-control new-spare-tool" placeholder="Tool No."></div>' +
+      '<div class="form-group" style="align-self:end"><button type="button" class="btn btn-light btn-small">Remove</button></div>';
+    row.querySelector("button").onclick = function() { row.remove(); if (!body.children.length) addNewSpareRow(); };
+    body.appendChild(row);
+    if (item) {
+      row.querySelector(".new-spare-id").value = item.itemId || "";
+      row.querySelector(".new-spare-name").value = item.itemName || "";
+      row.querySelector(".new-spare-qty").value = item.qty || "";
+      row.querySelector(".new-spare-tool").value = item.toolNo || "";
+    }
+  }
+
+  function submitNewSpareRequest() {
+    const common = materialRequestCommonData();
+    const station = (document.getElementById("newSpareStationId") || {}).value || "";
+    const body = document.getElementById("newSpareRows");
+    const items = [];
+    if (body) body.querySelectorAll(".form-grid-3").forEach(function(row) {
+      items.push({itemId:(row.querySelector(".new-spare-id")||{}).value || "", itemName:(row.querySelector(".new-spare-name")||{}).value || "", qty:Number((row.querySelector(".new-spare-qty")||{}).value || 0), toolNo:(row.querySelector(".new-spare-tool")||{}).value || "", requestType:""});
+    });
+    if (!common.email || !common.name || !common.mobile || !station.trim()) return materialRequestMessage("Please fill Email, Name, Mobile and Station / Machine.", false);
+    if (!items.length || items.some(function(x){return !x.itemId.trim() || x.qty <= 0;})) return materialRequestMessage("Har spare ke liye Item ID aur valid Qty bharein.", false);
+    common.stationId = station.trim(); common.requestType = "New Spare Request"; common.items = items;
+    materialRequestMessage("Submitting request…", true);
+    google.script.run.withSuccessHandler(function(r) {
+      materialRequestMessage(r && r.message ? r.message : (r && r.success ? "Request submitted." : "Request submit nahi hui."), !!(r && r.success));
+      if (r && r.success) { if (body) body.innerHTML = ""; addNewSpareRow(); }
+    }).withFailureHandler(function(e) { materialRequestMessage(e && e.message ? e.message : String(e), false); }).submitRequest(common);
+  }
+
+  function addStandaloneConsumedRow(item) {
+    const body = document.getElementById("standaloneConsumedRows"); if (!body) return;
+    const row = document.createElement("div"); row.className = "form-grid-3"; row.style.marginTop = "10px";
+    row.innerHTML = '<div class="form-group"><label>Spare Item ID *</label><input class="form-control consumed-item-id" placeholder="Item ID"></div><div class="form-group"><label>Qty *</label><input type="number" min="0.01" step="0.01" class="form-control consumed-item-qty" placeholder="Qty"></div><div class="form-group" style="align-self:end"><button type="button" class="btn btn-light btn-small">Remove</button></div>';
+    row.querySelector("button").onclick = function(){ row.remove(); if (!body.children.length) addStandaloneConsumedRow(); };
+    body.appendChild(row);
+    if (item) { row.querySelector(".consumed-item-id").value = item.itemId || ""; row.querySelector(".consumed-item-qty").value = item.qty || ""; }
+  }
+
+  function submitStandaloneConsumedSpare() {
+    const common = materialRequestCommonData();
+    const body = document.getElementById("standaloneConsumedRows"); const items = [];
+    if (body) body.querySelectorAll(".form-grid-3").forEach(function(row){items.push({itemId:(row.querySelector(".consumed-item-id")||{}).value || "",qty:Number((row.querySelector(".consumed-item-qty")||{}).value || 0)});});
+    common.ticketId = (document.getElementById("standaloneConsumedTicketId")||{}).value || ""; common.items = items;
+    if (!common.email || !common.name || !common.mobile) return materialRequestMessage("Email, Name aur Mobile required hain.", false);
+    if (!items.length || items.some(function(x){return !x.itemId.trim() || x.qty <= 0;})) return materialRequestMessage("Har spare ke liye Item ID aur valid Qty bharein.", false);
+    materialRequestMessage("Submitting consumed spare details…", true);
+    google.script.run.withSuccessHandler(function(r){materialRequestMessage(r&&r.message?r.message:(r&&r.success?"Saved successfully.":"Save failed."),!!(r&&r.success));if(r&&r.success){body.innerHTML="";addStandaloneConsumedRow();}}).withFailureHandler(function(e){materialRequestMessage(e&&e.message?e.message:String(e),false);}).submitConsumedSpareDetails(common);
+  }
+
+  function addBreakdownSpareRow(item) {
+    const body = document.getElementById("breakdownSpareRows"); if (!body) return;
+    const row = document.createElement("div"); row.className = "form-grid-3"; row.style.marginTop = "10px";
+    row.innerHTML = '<div class="form-group"><label>Consumed Spare Item ID *</label><input class="form-control breakdown-spare-id" placeholder="Item ID"></div><div class="form-group"><label>Qty *</label><input type="number" min="0.01" step="0.01" class="form-control breakdown-spare-qty" placeholder="Qty"></div><div class="form-group" style="align-self:end"><button type="button" class="btn btn-light btn-small">Remove</button></div>';
+    row.querySelector("button").onclick = function(){row.remove();if(!body.children.length)addBreakdownSpareRow();}; body.appendChild(row);
+    if(item){row.querySelector(".breakdown-spare-id").value=item.itemId||"";row.querySelector(".breakdown-spare-qty").value=item.qty||"";}
+  }
+
+  function toggleBreakdownSpareFields() {
+    const yes = document.getElementById("breakdownSpareUsed").value === "Yes";
+    const panel = document.getElementById("breakdownSparePanel"); if(panel)panel.style.display=yes?"block":"none";
+    if(yes){const rows=document.getElementById("breakdownSpareRows");if(rows&&!rows.children.length)addBreakdownSpareRow();}
+    else {const order=document.getElementById("breakdownOrderPanel");if(order)order.style.display="none";}
+  }
+  function toggleBreakdownOrderFields() {
+    const yes = document.getElementById("breakdownOrderSpare").value === "Yes";
+    const panel = document.getElementById("breakdownOrderPanel"); if(panel)panel.style.display=yes?"block":"none";
+    if(yes){const rows=document.getElementById("breakdownOrderRows");if(rows&&!rows.children.length)addBreakdownOrderRow();}
+  }
+  function addBreakdownOrderRow(item) {
+    const body=document.getElementById("breakdownOrderRows");if(!body)return;
+    const row=document.createElement("div");row.className="form-grid-3";row.style.marginTop="10px";
+    row.innerHTML='<div class="form-group"><label>Spare Item ID *</label><input class="form-control breakdown-order-id" placeholder="Item ID"></div><div class="form-group"><label>Qty *</label><input type="number" min="0.01" step="0.01" class="form-control breakdown-order-qty" placeholder="Qty"></div><div class="form-group" style="align-self:end"><button type="button" class="btn btn-light btn-small">Remove</button></div>';
+    row.querySelector("button").onclick=function(){row.remove();if(!body.children.length)addBreakdownOrderRow();};body.appendChild(row);
+    if(item){row.querySelector(".breakdown-order-id").value=item.itemId||"";row.querySelector(".breakdown-order-qty").value=item.qty||"";}
+  }
+  function submitBreakdownRequest() {
+    // Prevent rapid double-clicks in the browser.
+    if (window.__breakdownSubmissionInProgress) return;
+    window.__breakdownSubmissionInProgress = true;
+
+    const submitBtn = document.querySelector(
+      '#breakdownSubmissionPanel button[onclick="submitBreakdownRequest()"]'
+    );
+    const originalButtonText = submitBtn ? submitBtn.textContent : "Submit Breakdown";
+    if (submitBtn) {
+      submitBtn.disabled = true;
+      submitBtn.textContent = "Submitting...";
+    }
+
+    const unlockSubmit = function() {
+      window.__breakdownSubmissionInProgress = false;
+      if (submitBtn) {
+        submitBtn.disabled = false;
+        submitBtn.textContent = originalButtonText;
+      }
+    };
+
+    const common = materialRequestCommonData();
+    const val = function(id) {
+      const e = document.getElementById(id);
+      return e ? e.value.trim() : "";
+    };
+
+    const spares = [];
+    const orders = [];
+    const sb = document.getElementById("breakdownSpareRows");
+    if (sb) sb.querySelectorAll(".form-grid-3").forEach(function(r) {
+      spares.push({
+        itemId: (r.querySelector(".breakdown-spare-id") || {}).value || "",
+        qty: Number((r.querySelector(".breakdown-spare-qty") || {}).value || 0)
+      });
+    });
+
+    const ob = document.getElementById("breakdownOrderRows");
+    if (ob) ob.querySelectorAll(".form-grid-3").forEach(function(r) {
+      orders.push({
+        itemId: (r.querySelector(".breakdown-order-id") || {}).value || "",
+        qty: Number((r.querySelector(".breakdown-order-qty") || {}).value || 0)
+      });
+    });
+
+    const payload = {
+      sessionId: currentSessionId,
+      email: common.email,
+      name: common.name,
+      mobile: common.mobile,
+      ticketId: val("breakdownTicketId"),
+      breakdownType: val("breakdownType"),
+      issueOwner: val("breakdownIssueOwner"),
+      startTime: val("breakdownStartTime"),
+      endTime: val("breakdownEndTime"),
+      actualTpt: Number(val("breakdownActualTpt") || 0),
+      caseNo: val("breakdownCaseNo"),
+      spareUsed: val("breakdownSpareUsed"),
+      spares: spares,
+      orderSpare: val("breakdownOrderSpare") || "No",
+      orderSpares: orders
+    };
+
+    if (!payload.email || !payload.name || !payload.mobile) {
+      unlockSubmit();
+      return materialRequestMessage("Email, Name aur Mobile required hain.", false);
+    }
+    if (!payload.ticketId || !payload.breakdownType || !payload.issueOwner ||
+        !payload.startTime || !payload.endTime || !payload.spareUsed) {
+      unlockSubmit();
+      return materialRequestMessage("Breakdown ke saare required fields bharein.", false);
+    }
+    if (payload.spareUsed === "Yes" &&
+        (!spares.length || spares.some(function(x) {
+          return !String(x.itemId).trim() || x.qty <= 0;
+        }))) {
+      unlockSubmit();
+      return materialRequestMessage("Consumed spare ke liye Item ID aur valid Qty bharein.", false);
+    }
+    if (payload.spareUsed === "Yes" && payload.orderSpare === "Yes" &&
+        (!orders.length || orders.some(function(x) {
+          return !String(x.itemId).trim() || x.qty <= 0;
+        }))) {
+      unlockSubmit();
+      return materialRequestMessage("Order spare ke liye Item ID aur valid Qty bharein.", false);
+    }
+
+    materialRequestMessage("Submitting breakdown…", true);
+
+    google.script.run
+      .withSuccessHandler(function(r) {
+        const ok = !!(r && r.success);
+        materialRequestMessage(
+          r && r.message ? r.message : (ok ? "Breakdown submitted." : "Submission failed."),
+          ok
+        );
+
+        if (ok) {
+          // Clear only Breakdown fields after confirmed successful save.
+          [
+            "breakdownTicketId",
+            "breakdownType",
+            "breakdownIssueOwner",
+            "breakdownStartTime",
+            "breakdownEndTime",
+            "breakdownActualTpt",
+            "breakdownCaseNo",
+            "breakdownSpareUsed",
+            "breakdownOrderSpare"
+          ].forEach(function(id) {
+            const el = document.getElementById(id);
+            if (el) el.value = "";
+          });
+
+          ["breakdownSpareRows", "breakdownOrderRows"].forEach(function(id) {
+            const el = document.getElementById(id);
+            if (el) el.innerHTML = "";
+          });
+
+          const sparePanel = document.getElementById("breakdownSparePanel");
+          const orderPanel = document.getElementById("breakdownOrderPanel");
+          if (sparePanel) sparePanel.style.display = "none";
+          if (orderPanel) orderPanel.style.display = "none";
+        }
+
+        unlockSubmit();
+      })
+      .withFailureHandler(function(e) {
+        materialRequestMessage(
+          e && e.message ? e.message : String(e),
+          false
+        );
+        // Keep all entered values if the server reports an error.
+        unlockSubmit();
+      })
+      .submitBreakdownFromMaterialRequest(payload);
+  }
+  function resetRequestForm() {
+    ["breakdownTicketId","breakdownType","breakdownIssueOwner","breakdownStartTime","breakdownEndTime","breakdownActualTpt","breakdownCaseNo","breakdownSpareUsed","breakdownOrderSpare","newSpareStationId","standaloneConsumedTicketId"].forEach(function(id){const e=document.getElementById(id);if(e)e.value="";});
+    ["newSpareRows","standaloneConsumedRows","breakdownSpareRows","breakdownOrderRows"].forEach(function(id){const e=document.getElementById(id);if(e)e.innerHTML="";});
+    const type=document.getElementById("requestType");if(type)type.value="";
+    const msg=document.getElementById("submitMessage");if(msg){msg.textContent="";msg.className="message";}
+    handleMaterialRequestModeChange();
+  }
+
 </script>
 
 </body>
