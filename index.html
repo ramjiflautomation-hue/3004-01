@@ -2648,33 +2648,6 @@
     }).getCurrentPortalPermissions(currentSessionId);
   }
 
-
-  // Defensive PM task filter: navigation links and blank rows are never tasks.
-  function isActualPMTask_(row) {
-    if (!row || typeof row !== "object") return false;
-
-    const module = String(row.module || "").trim();
-    const component = String(row.component || "").trim();
-    const checkpoint = String(row.checkpoint || "").trim();
-
-    const identityText = [module, component, checkpoint].join(" ").toLowerCase();
-
-    // Exclude navigation / instruction rows such as "Go to Main Sheet".
-    if (identityText.includes("main sheet")) return false;
-
-    // A real checklist task must have at least one task-identifying field.
-    if (!module && !component && !checkpoint) return false;
-
-    // A real task must be assigned a valid ISO due date.
-    const dates = Array.isArray(row.dueDates) && row.dueDates.length
-      ? row.dueDates
-      : [row.dueDate || ""];
-
-    return dates.some(function(date) {
-      return /^\\d{4}-\\d{2}-\\d{2}$/.test(String(date || "").trim());
-    });
-  }
-
   function loadPMChecklist() {
     const monthSelect=document.getElementById("pmMonthFilter");
     if(monthSelect && monthSelect.dataset.initialized!=="1"){
@@ -2700,9 +2673,7 @@
         if(body)body.innerHTML='<tr><td colspan="9">Checklist unavailable.</td></tr>';
         return;
       }
-      // Apply the same task-only rule in the portal UI as a second safeguard.
-      // This ensures blank/navigation rows never affect month or date-card totals.
-      pmChecklistRows=(res.rows||[]).filter(isActualPMTask_);
+      pmChecklistRows=res.rows||[];
       if(pmSelectedDate&&!pmGetDateRows_(pmSelectedDate).length)pmSelectedDate="";
       renderPMChecklist();
       if(msg){msg.className="message success show";msg.textContent=(res.message||("Loaded "+pmChecklistRows.length+" checklist points."))+" Select a date below to see its details.";}
