@@ -2461,7 +2461,7 @@
           <div class="stat-card"><div class="label">TPT / Loss</div><div class="value" id="reportTptLoss">₹0.00</div></div>
           <div class="stat-card"><div class="label">Spare Consumed</div><div class="value" id="reportSpareConsumed">0.00</div></div>
         </div>
-        <div class="panel"><div class="panel-header"><h3>Selected Period Breakdown Details</h3></div><div class="panel-body"><div class="table-wrap"><table class="data-table breakdown-dashboard-table"><thead><tr><th>Date</th><th>Ticket ID</th><th>Total Taken Time (hrs)</th><th>Issue Owner</th><th>TPT Loss %</th><th>Case No.</th></tr></thead><tbody id="reportBreakdownDetailsBody"><tr><td colspan="6" class="loading">Select report dates.</td></tr></tbody></table></div><p style="font-size:12px;color:#6b7280;margin:12px 0 0;">Planned Downtime is excluded from Breakdown Hours and TPT Loss. Fixed Scheduled Downtime (13:00–14:00 and 22:00–23:00) is also excluded from breakdown duration.</p></div></div>
+        <div class="panel"><div class="panel-header"><h3>Selected Period Breakdown Details</h3><button type="button" class="btn btn-success btn-small" onclick="downloadBreakdownHistoryCSV()">↓ Download Breakdown History (CSV)</button></div><div class="panel-body"><div class="table-wrap"><table class="data-table breakdown-dashboard-table"><thead><tr><th>Date</th><th>Ticket ID</th><th>Total Taken Time (hrs)</th><th>Issue Owner</th><th>TPT Loss %</th><th>Case No.</th></tr></thead><tbody id="reportBreakdownDetailsBody"><tr><td colspan="6" class="loading">Select report dates.</td></tr></tbody></table></div><p style="font-size:12px;color:#6b7280;margin:12px 0 0;">Planned Downtime is excluded from Breakdown Hours and TPT Loss. Fixed Scheduled Downtime (13:00–14:00 and 22:00–23:00) is also excluded from breakdown duration.</p></div></div>
       </section>
 
       <!-- SETTINGS -->
@@ -3933,6 +3933,49 @@
      REPORTS
      ========================================================= */
 
+  // Stores exactly the breakdown detail rows currently loaded for the selected report period.
+  let reportBreakdownExportRows = [];
+
+  function downloadBreakdownHistoryCSV(){
+    const rows = Array.isArray(reportBreakdownExportRows) ? reportBreakdownExportRows : [];
+    if(!rows.length){
+      alert("Selected date range mein download karne ke liye breakdown history nahi hai. Pehle Apply karke report load karein.");
+      return;
+    }
+    const columns = [
+      ["Date", "date"],
+      ["Ticket ID", "ticketId"],
+      ["Total Taken Time (hrs)", "totalTakenTime"],
+      ["Issue Owner", "issueOwner"],
+      ["TPT Loss %", "tptLossPercent"],
+      ["Case No.", "caseNo"]
+    ];
+    const csvCell = function(value){
+      let text = value == null ? "" : String(value);
+      return '"' + text.replace(/"/g, '""') + '"';
+    };
+    const lines = [columns.map(function(c){return csvCell(c[0]);}).join(",")];
+    rows.forEach(function(row){
+      lines.push(columns.map(function(c){
+        const value = row[c[1]];
+        if(c[1] === "totalTakenTime" || c[1] === "tptLossPercent") return csvCell(Number(value || 0));
+        return csvCell(value);
+      }).join(","));
+    });
+    const csv = "\uFEFF" + lines.join("\r\n");
+    const blob = new Blob([csv], {type:"text/csv;charset=utf-8;"});
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    const from = (document.getElementById("reportFromDate")||{}).value || "all";
+    const to = (document.getElementById("reportToDate")||{}).value || "all";
+    link.href = url;
+    link.download = "Breakdown_History_" + from + "_to_" + to + ".csv";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
+
   function loadReportSummary(){
     if(!isAdminUser())return;
     const f=document.getElementById("reportFromDate"), t=document.getElementById("reportToDate"), now=new Date();
@@ -3946,6 +3989,7 @@
       .withSuccessHandler(function(data){
         if(window.hidePortalLoading) window.hidePortalLoading();
         if(!data||data.success===false){
+          reportBreakdownExportRows = [];
           if(body)body.innerHTML='<tr><td colspan="4" class="loading">'+escapeHtml((data&&data.message)||"Report could not be loaded.")+'</td></tr>';
           return;
         }
@@ -3972,6 +4016,7 @@
         }
         const detailBody=document.getElementById("reportBreakdownDetailsBody");
         const detailRows=data.breakdownDetails||[];
+        reportBreakdownExportRows = detailRows.slice();
         if(detailBody){
           detailBody.innerHTML=detailRows.length?detailRows.map(function(r){
             return '<tr><td>'+escapeHtml(r.date||"")+'</td><td>'+escapeHtml(r.ticketId||"")+'</td><td>'+Number(r.totalTakenTime||0).toFixed(2)+'</td><td>'+escapeHtml(r.issueOwner||"")+'</td><td>'+Number(r.tptLossPercent||0).toFixed(2)+'%</td><td>'+escapeHtml(r.caseNo||"")+'</td></tr>';
@@ -3980,6 +4025,7 @@
       })
       .withFailureHandler(function(error){
         if(window.hidePortalLoading) window.hidePortalLoading();
+        reportBreakdownExportRows = [];
         if(body)body.innerHTML='<tr><td colspan="4" class="loading">Report error: '+escapeHtml(error&&error.message?error.message:String(error))+'</td></tr>';
       })
       .getReportSummary(currentSessionId,f?f.value:"",t?t.value:"");
