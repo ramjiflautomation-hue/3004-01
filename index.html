@@ -1407,6 +1407,40 @@
 
     @media(max-width:650px){.pm-date-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}
 
+    /* Global process indicator */
+    #portalLoadingOverlay {
+      position: fixed; inset: 0; z-index: 999999;
+      display: none; align-items: center; justify-content: center;
+      background: rgba(15, 23, 42, .32);
+      backdrop-filter: blur(1.5px);
+    }
+    /* Hide only the small "Opening page / Processing" popup.
+       Keep all existing loading logic and the separate startup splash unchanged. */
+    #portalLoadingOverlay {
+      display: none !important;
+      visibility: hidden !important;
+      pointer-events: none !important;
+    }
+    #portalLoadingOverlay.is-visible { display: flex; }
+    #portalLoadingOverlay .portal-loading-card {
+      min-width: 220px; max-width: calc(100vw - 40px);
+      padding: 22px 28px; border-radius: 14px; background: #fff;
+      box-shadow: 0 12px 36px rgba(15,23,42,.22);
+      display: flex; flex-direction: column; align-items: center; gap: 12px;
+      color: #1f4e79; font-size: 14px; font-weight: 700; text-align: center;
+    }
+    #portalLoadingOverlay .portal-spinner {
+      width: 42px; height: 42px; border: 4px solid #dbeafe;
+      border-top-color: #1769aa; border-radius: 50%;
+      animation: portalSpin .2s linear infinite;
+    }
+    #portalLoadingOverlay .portal-loading-sub { font-size: 12px; font-weight: 400; color: #64748b; }
+    @keyframes portalSpin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) {
+      #portalLoadingOverlay .portal-spinner { animation-duration: 1.8s; }
+    }
+
+  
     /* Compact dashboard breakdown detail table */
     #page-dashboard .breakdown-dashboard-table {
       width:100%;
@@ -1437,6 +1471,14 @@
 </head>
 
 <body>
+
+<div id="portalLoadingOverlay" role="status" aria-live="polite" aria-hidden="true">
+  <div class="portal-loading-card">
+    <div class="portal-spinner" aria-hidden="true"></div>
+    <div id="portalLoadingText">Processing, please wait…</div>
+    <div class="portal-loading-sub">Please do not refresh or close this page.</div>
+  </div>
+</div>
 
 <!-- STARTUP SPLASH -->
 <div id="startupSplash" aria-label="Portal startup screen">
@@ -2533,10 +2575,62 @@
 </div>
 
 <script>
-// Loading popup disabled as requested.
-// Keep these functions as no-ops because existing portal actions call them.
-window.showPortalLoading = function(){};
-window.hidePortalLoading = function(){};
+(function(){
+  var overlay, label, hideTimer = null, shownAt = 0;
+  function init(){ overlay=document.getElementById('portalLoadingOverlay'); label=document.getElementById('portalLoadingText'); }
+  window.showPortalLoading = function(message, timeoutMs){
+    if(!overlay) init();
+    if(!overlay) return;
+    if(label) label.textContent = message || 'Processing, please wait…';
+    overlay.classList.add('is-visible'); overlay.setAttribute('aria-hidden','false');
+    shownAt=Date.now();
+    if(hideTimer) clearTimeout(hideTimer);
+    hideTimer=setTimeout(function(){ window.hidePortalLoading(); }, timeoutMs || 60000);
+  };
+  window.hidePortalLoading = function(){
+    if(!overlay) init();
+    if(!overlay) return;
+    overlay.classList.remove('is-visible'); overlay.setAttribute('aria-hidden','true');
+    if(hideTimer) clearTimeout(hideTimer); hideTimer=null;
+  };
+  document.addEventListener('DOMContentLoaded', function(){
+    init();
+    document.addEventListener('submit', function(e){
+      var form=e.target;
+      if(form && form.dataset && form.dataset.noGlobalLoader === 'true') return;
+      window.showPortalLoading('Submitting…');
+    }, true);
+    document.addEventListener('click', function(e){
+      var el=e.target && e.target.closest ? e.target.closest('button, input[type="submit"], input[type="button"], a[data-loading="true"]') : null;
+      if(!el || el.disabled || el.dataset.noGlobalLoader === 'true') return;
+      var text=(el.innerText || el.value || '').replace(/\s+/g,' ').trim().toLowerCase();
+      if(!text) text='Processing, please wait…';
+      var msg=/refresh|reload/.test(text) ? 'Refreshing data…' :
+              /save|submit|update|close|reject|approve|login|logout|delete|add|create|upload/.test(text) ? 'Submitting…' :
+              /main dashboard|back|dashboard/.test(text) ? 'Opening page…' : 'Processing, please wait…';
+      window.showPortalLoading(msg);
+    }, true);
+    var observer = new MutationObserver(function(mutations){
+      var shouldHide=false;
+      for(var i=0;i<mutations.length;i++){
+        var t=mutations[i].target;
+        if(t && t.nodeType===1){
+          if(t.classList && (t.classList.contains('show') || t.classList.contains('success') || t.classList.contains('error'))) shouldHide=true;
+          if(t.id==='pmChecklistBody' && !/loading checklist/i.test(t.textContent||'')) shouldHide=true;
+          if((t.id==='pmChecklistMessage' || t.id==='rosterMessage') && String(t.textContent||'').trim()) shouldHide=true;
+        }
+        if(mutations[i].addedNodes){
+          for(var j=0;j<mutations[i].addedNodes.length;j++){
+            var n=mutations[i].addedNodes[j];
+            if(n.nodeType===1 && /loaded|saved|success|failed|unavailable|no tasks|no dates|could not load/i.test(n.textContent||'')) shouldHide=true;
+          }
+        }
+      }
+      if(shouldHide) window.hidePortalLoading();
+    });
+    observer.observe(document.body, {subtree:true, childList:true, characterData:true, attributes:true, attributeFilter:['class']});
+  });
+})();
 </script>
 
 <script>
